@@ -18,7 +18,21 @@ pub(crate) mod sync;
 ///
 /// Useful for interrupting the natural worker workflow to tell it something.
 enum WorkerSignal {
+    Ping,
     Terminate,
+}
+
+struct StageWorker<
+    I: Send + 'static,
+    O: Send + 'static,
+    F: FnOnce(I) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Vec<Option<O>>> + Send + 'static,
+> {
+    name: String,
+    signal_rx: Receiver<WorkerSignal>,
+    inputs: PipeReader<I>,
+    outputs: Vec<PipeWriter<O>>,
+    task_definition: F,
 }
 
 /// Provided by [Pipeline::from_pipes], used to create the I/O objects for each end of a pipe.
@@ -130,7 +144,7 @@ impl Pipeline {
         (
             Self {
                 synchronizer: sync.clone(),
-                workers: JoinSet::new(),
+                workers: JoinSet::default(),
                 signal_txs: HashMap::new(),
             },
             Pipes {
@@ -143,20 +157,28 @@ impl Pipeline {
     /// Wait for all stage workers in the pipeline to finish.
     ///
     /// Once all workers are done running, send the `TERMINATE` signal to all the workers.
-    pub async fn wait(&mut self) {
-        loop {
-            if self.synchronizer.completed() {
-                for tx in self.signal_txs.values() {
-                    tx.send(WorkerSignal::Terminate)
-                        .await
-                        .expect("failed to send done signal")
-                }
-                break;
-            }
-        }
+    pub async fn wait(mut self) {
+        let workers = &mut self.workers;
 
-        while let Some(res) = self.workers.join_next().await {
-            res.unwrap();
+        let check_workers_completed = async {
+            // todo - log join results if failures
+            while workers.join_next().await.is_some() {}
+        };
+
+        let check_sync_completed = async {
+            while !self.synchronizer.completed() {}
+
+            for tx in self.signal_txs.values() {
+                tx.send(WorkerSignal::Terminate)
+                    .await
+                    .expect("failed to send done signal")
+            }
+        };
+
+        // If either the synchronizer determines we're done, or all workers completed, we're done
+        select! {
+            _ = check_workers_completed => {},
+            _ = check_sync_completed => {},
         }
     }
 
@@ -164,12 +186,6 @@ impl Pipeline {
     ///
     /// This is considered defining a "stage".
     ///
-    /// ### Arguments:
-    ///
-    /// name - A name given to the worker; must be unique
-    /// inputs - Created by [Pipeline::create_pipe], where the worker receives input
-    /// outputs - Created by [Pipeline::create_pipe], where the worker sends output
-    /// worker_def - A function that receives a single input and produces output
     pub fn register_worker<I, O, F, Fut>(
         &mut self,
         name: impl Into<String>,
@@ -187,59 +203,77 @@ impl Pipeline {
         let (signal_tx, signal_rx) = channel(1);
         self.signal_txs.insert(name.clone(), signal_tx);
 
-        self.workers.spawn(Self::new_worker(
+        self.workers.spawn(Self::new_worker(StageWorker {
             name,
             signal_rx,
             inputs,
             outputs,
-            worker_def.clone(),
-        ));
+            task_definition: worker_def,
+        }));
     }
 
-    async fn new_worker<I, O, F, Fut>(
-        name: String,
-        mut signal_rx: Receiver<WorkerSignal>,
-        mut inputs: PipeReader<I>,
-        outputs: Vec<PipeWriter<O>>,
-        worker_def: F,
-    ) where
+    async fn new_worker<I, O, F, Fut>(mut worker: StageWorker<I, O, F, Fut>)
+    where
         I: Send + 'static,
         O: Send + 'static,
         F: FnOnce(I) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = Vec<Option<O>>> + Send + 'static,
     {
+        // Individual tasks asynchronously operating on received input
         let mut tasks = JoinSet::new();
 
-        let tasks_ref = &mut tasks;
-        select! {
-            _ = async move {
-                while let Some(input) = inputs.next().await {
+        loop {
+            // Reference to avoid moving into closures below
+            let tasks_ref = &mut tasks;
+            let StageWorker {
+                name,
+                signal_rx,
+                inputs,
+                outputs,
+                task_definition,
+            } = &mut worker;
+
+            // Primary stage worker loop
+            let stage_worker_loop = async move {
+                while let Some(input) = inputs.read().await {
                     let consumed = inputs.consumed_callback();
                     let outputs = outputs.clone();
-                    let work = worker_def.clone();
+                    let task = task_definition.clone();
 
                     tasks_ref.spawn(async move {
-                        let results = work(input).await;
-                        consumed();
-
+                        let results = task(input).await;
                         for (i, value) in results.into_iter().enumerate() {
                             if let Some(result) = value {
                                 outputs
                                     .get(i)
-                                    .expect("produced output count does not equal output pipe count")
-                                    .submit(result)
+                                    .expect(
+                                        "produced output count does not equal output pipe count",
+                                    )
+                                    .write(result)
                                     .await;
                             }
                         }
+
+                        // Mark input as consumed *after* writing outputs
+                        // (avoids false positive of completed pipeline)
+                        consumed();
                     });
                 }
-            } => {}
+            };
 
-            Some(signal) = signal_rx.recv() => {
-                match signal {
-                    WorkerSignal::Terminate => (),
+            select! {
+                _ = stage_worker_loop => {
+                    break
                 }
-            },
+
+                // Receive external signals
+                Some(signal) = signal_rx.recv() => {
+                    match signal {
+                        WorkerSignal::Terminate => break,
+                        WorkerSignal::Ping => println!("Number of tasks for {}: {}", name, tasks.len())
+                    }
+                },
+            }
         }
 
         while tasks.join_next().await.is_some() {}
@@ -266,15 +300,15 @@ mod tests {
         expected_names.sort();
 
         let (pipeline, pipes) = Pipeline::from_pipes(expected_names.clone());
-        let mut acutal_names = pipes
+        let mut actual_names = pipes
             .names_to_ids
             .keys()
             .map(|s| s.deref())
             .collect::<Vec<&str>>();
-        acutal_names.sort();
+        actual_names.sort();
 
         assert_eq!(pipes.names_to_ids.len(), 3);
-        assert_eq!(acutal_names, expected_names);
+        assert_eq!(actual_names, expected_names);
 
         assert!(Arc::ptr_eq(&pipeline.synchronizer, &pipes.synchronizer));
         for name in expected_names {

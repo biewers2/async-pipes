@@ -30,12 +30,10 @@ impl<T> PipeReader<T> {
     pub(crate) fn consumed_callback(&self) -> impl FnOnce() {
         let id = self.pipe_id.clone();
         let sync = self.synchronizer.clone();
-        move || {
-            sync.ended(id);
-        }
+        move || sync.ended(id)
     }
 
-    pub(crate) async fn next(&mut self) -> Option<T> {
+    pub(crate) async fn read(&mut self) -> Option<T> {
         self.rx.recv().await
     }
 }
@@ -73,12 +71,8 @@ impl<T> PipeWriter<T> {
         }
     }
 
-    pub(crate) async fn submit(&self, value: T) {
+    pub async fn write(&self, value: T) {
         self.synchronizer.started(&self.pipe_id);
-        self.send(value).await;
-    }
-
-    async fn send(&self, value: T) {
         self.tx
             .send(value)
             .await
