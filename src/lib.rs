@@ -58,11 +58,12 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
+use std::panic;
 use std::sync::Arc;
 
 use tokio::select;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::task::JoinSet;
+use tokio::task::{JoinError, JoinSet};
 
 pub use io::*;
 
@@ -226,10 +227,10 @@ impl Pipeline {
         let workers = &mut self.stage_workers;
 
         let check_workers_completed = async {
-            // todo - log join results if failures
-            while workers.join_next().await.is_some() {}
+            while let Some(result) = workers.join_next().await {
+                Self::check_join_result(&result);
+            }
         };
-
         let check_sync_completed = async {
             while !self.synchronizer.completed().await {}
 
@@ -286,27 +287,25 @@ impl Pipeline {
         Fut: Future<Output = Vec<Option<O>>> + Send + 'static,
     {
         // Individual tasks asynchronously operating on received input
-        let mut tasks = JoinSet::new();
+        let StageWorker {
+            name,
+            signal_rx,
+            inputs,
+            outputs,
+            task_definition,
+        } = &mut worker;
 
+        let mut tasks = JoinSet::new();
         loop {
             // Reference to avoid moving into closures below
-            let tasks_ref = &mut tasks;
-            let StageWorker {
-                name,
-                signal_rx,
-                inputs,
-                outputs,
-                task_definition,
-            } = &mut worker;
-
-            // Primary stage worker loop
-            let stage_worker_loop = async move {
-                while let Some(input) = inputs.read().await {
+            select! {
+                // Start SWL
+                Some(input) = inputs.read() => {
                     let consumed = inputs.consumed_callback();
                     let outputs = outputs.clone();
                     let task = task_definition.clone();
 
-                    tasks_ref.spawn(async move {
+                    tasks.spawn(async move {
                         let results = task(input).await;
                         for (i, value) in results.into_iter().enumerate() {
                             if let Some(result) = value {
@@ -325,24 +324,33 @@ impl Pipeline {
                         consumed().await;
                     });
                 }
-            };
 
-            select! {
-                _ = stage_worker_loop => {
-                    break
+                // Join tasks to check for errors
+                Some(result) = tasks.join_next() => {
+                    Self::check_join_result(&result);
                 }
 
                 // Receive external signals
                 Some(signal) = signal_rx.recv() => {
                     match signal {
                         StageWorkerSignal::Terminate => break,
-                        StageWorkerSignal::Ping => println!("Number of tasks for {}: {}", name, tasks.len())
+                        StageWorkerSignal::Ping => println!("Responding from {}", name),
                     }
                 },
             }
         }
 
-        while tasks.join_next().await.is_some() {}
+        tasks.shutdown().await;
+    }
+
+    fn check_join_result<T>(result: &Result<T, JoinError>) {
+        if let Err(e) = result {
+            if e.is_panic() {
+                // TODO - figure out to get `select!` to NOT provide a borrowed result
+                // panic::resume_unwind(e.into_panic())
+                panic!("task panicked!")
+            }
+        }
     }
 }
 
@@ -350,8 +358,12 @@ impl Pipeline {
 mod tests {
     use std::ops::Deref;
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use crate::Pipeline;
+    use tokio::join;
+    use tokio::sync::Mutex;
+
+    use crate::{PipeWriter, Pipeline, StageWorkerSignal};
 
     #[test]
     fn test_pipeline_from_no_pipes_succeeds() {
@@ -391,5 +403,44 @@ mod tests {
 
         assert!(pipes.create_io::<()>("undefined").is_none());
         assert!(pipes.create_io::<()>("start").is_some());
+    }
+
+    #[tokio::test]
+    #[should_panic]
+    async fn test_stage_worker_propagates_task_panic() {
+        let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["pipe"]);
+        let (w, r) = pipes.create_io("pipe").unwrap();
+
+        pipeline.register_stage(
+            "test-stage",
+            r,
+            Vec::<PipeWriter<Option<()>>>::new(),
+            |_: ()| async move { panic!("AHH!") },
+        );
+        w.write(()).await;
+        pipeline.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_stage_worker_signal_terminate() {
+        let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["pipe"]);
+        let (w, r) = pipes.create_io("pipe").unwrap();
+
+        pipeline.register_stage(
+            "test-stage",
+            r,
+            Vec::<PipeWriter<Option<()>>>::new(),
+            |_: ()| async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                panic!("worker did not terminate!");
+            },
+        );
+        w.write(()).await;
+
+        let signaller = pipeline.signal_txs["test-stage"].clone();
+        let _ = join!(
+            pipeline.wait(),
+            signaller.send(StageWorkerSignal::Terminate),
+        );
     }
 }
