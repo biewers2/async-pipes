@@ -5,11 +5,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::sync;
-use crate::Pipeline;
 
 /// Defines an end to a pipe that allows data to be received from.
 ///
-/// Provide this to [Pipeline::register_stage] as the input for that stage.
+/// Provide this to [crate::Pipeline::register_stage] as the input for that stage.
 #[derive(Debug)]
 pub struct PipeReader<T> {
     pipe_id: String,
@@ -30,6 +29,13 @@ impl<T> PipeReader<T> {
         }
     }
 
+    /// Provides a callback function to be called once the task has handled a provided
+    /// input from this reader.
+    ///
+    /// This callback function decrements the task count for this pipe.
+    ///
+    /// We use a callback function here so it can be passed and called in the task definition
+    /// without having to give ownership of this reader to the task definition.
     pub(crate) fn consumed_callback(
         &self,
     ) -> impl FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> {
@@ -38,6 +44,7 @@ impl<T> PipeReader<T> {
         || Box::pin(async move { sync.ended(id).await })
     }
 
+    /// Receive the next value from the inner receiver.
     pub(crate) async fn read(&mut self) -> Option<T> {
         self.rx.recv().await
     }
@@ -45,7 +52,7 @@ impl<T> PipeReader<T> {
 
 /// Defines an end to a pipe that allows data to be sent through.
 ///
-/// Provide this to [Pipeline::register_stage] as an output for a stage.
+/// Provide this to [crate::Pipeline::register_stage] as an output for a stage.
 #[derive(Debug)]
 pub struct PipeWriter<T> {
     pipe_id: String,
@@ -53,6 +60,8 @@ pub struct PipeWriter<T> {
     tx: Sender<T>,
 }
 
+/// Manually implement [Clone] for [PipeWriter] over [T], as deriving [Clone]
+/// Does not implement it over generic parameters.
 impl<T> Clone for PipeWriter<T> {
     fn clone(&self) -> Self {
         Self {
@@ -76,6 +85,7 @@ impl<T> PipeWriter<T> {
         }
     }
 
+    /// Increment the task count for this pipe and then send the value through the channel.
     pub async fn write(&self, value: T) {
         self.synchronizer.started(&self.pipe_id).await;
         self.tx
