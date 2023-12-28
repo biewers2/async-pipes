@@ -17,7 +17,7 @@
 //!     let (map_to_reduce_w, map_to_reduce_r) = pipes.create_io("MapToReduce").unwrap();
 //!
 //!     // After creating the pipes, stage workers are registered in the pipeline.
-//!     pipeline.register_stage(
+//!     pipeline.register_branching(
 //!         "MapStage",
 //!         map_input_r,
 //!         vec![map_to_reduce_w],
@@ -32,7 +32,7 @@
 //!     let total_count = Arc::new(Mutex::new(0));
 //!     let reduce_total_count = total_count.clone();
 //!
-//!     pipeline.register_stage(
+//!     pipeline.register_branching(
 //!         "ReduceStage",
 //!         map_to_reduce_r,
 //!         vec![],
@@ -54,6 +54,7 @@
 //! }
 //! ```
 //!
+#![warn(missing_docs)]
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -63,14 +64,17 @@ use std::sync::Arc;
 
 use tokio::select;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::Mutex;
 use tokio::task::{JoinError, JoinSet};
 
 pub use io::*;
+pub use util::*;
 
 use crate::sync::Synchronizer;
 
 mod io;
 pub(crate) mod sync;
+mod util;
 
 /// Signals sent to stage workers.
 ///
@@ -97,8 +101,8 @@ struct StageWorker<
 > {
     name: String,
     signal_rx: Receiver<StageWorkerSignal>,
-    inputs: PipeReader<I>,
-    outputs: Vec<PipeWriter<O>>,
+    reader: PipeReader<I>,
+    writers: Vec<PipeWriter<O>>,
     task_definition: F,
 }
 
@@ -160,15 +164,87 @@ impl Pipes {
 /// A pipeline defines the infrastructure for managing stage workers and transferring data between them
 /// using pipes defined by the workers.
 ///
-/// To create a pipeline, use [Pipeline::from_pipes].
-///
 /// # Examples
 ///
-/// TODO
+/// Creating a single producer and a single consumer.
+/// ```
+/// use plumber::atomic_mut;
 ///
+/// tokio_test::block_on(async {
+///     use plumber::{atomic_mut_cloned, Pipeline, PipeReader, Pipes, PipeWriter};
+///
+///     let (mut pipeline, mut pipes): (Pipeline, Pipes) = Pipeline::from_pipes(vec!["pipe"]);
+///     let (writer, reader) = pipes.create_io::<usize>("pipe").unwrap();
+///
+///     // Produce values 1 through 10
+///     let count = atomic_mut(0);
+///     pipeline.register_producer("producer", writer, || async move {
+///         let mut count = count.lock().await;
+///         if *count < 10 {
+///             *count += 1;
+///             Some(*count)
+///         } else {
+///             None
+///         }
+///     });
+///
+///     let (sum, wk_sum) = atomic_mut_cloned(0);
+///     pipeline.register_consumer("consumer", reader, |n: usize| async move {
+///         *wk_sum.lock().await += n;
+///     });
+///
+///     pipeline.wait().await;
+///
+///     assert_eq!(*sum.lock().await, 55);
+/// });
+/// ```
+///
+/// Creating a branching producer and two consumers for each branch.
+/// ```
+/// use plumber::atomic_mut;
+/// tokio_test::block_on(async {
+///     use plumber::{atomic_mut_cloned, Pipeline , Pipes };
+///
+///     let (mut pipeline, mut pipes): (Pipeline, Pipes) = Pipeline::from_pipes(vec!["evens", "odds"]);
+///     let (evens_w, evens_r) = pipes.create_io::<usize>("evens").unwrap();
+///     let (odds_w, odds_r) = pipes.create_io::<usize>("odds").unwrap();
+///
+///     let count = atomic_mut(0);
+///     pipeline.register_branching_producer("producer", vec![evens_w, odds_w], || async move {
+///         let mut count = count.lock().await;
+///         if *count >= 10 {
+///             return None;
+///         }
+///         *count += 1;
+///
+///         let output = if *count % 2 == 0 {
+///             vec![Some(*count), None]
+///         } else {
+///             vec![None, Some(*count)]
+///         };
+///
+///         Some(output)
+///     });
+///
+///     let (odds_sum, wk_odds_sum) = atomic_mut_cloned(0);
+///     pipeline.register_consumer("odds-consumer", odds_r, |n: usize| async move {
+///         *wk_odds_sum.lock().await += n;
+///     });
+///     let (evens_sum, wk_evens_sum) = atomic_mut_cloned(0);
+///     pipeline.register_consumer("evens-consumer", evens_r, |n: usize| async move {
+///         *wk_evens_sum.lock().await += n;
+///     });
+///
+///     pipeline.wait().await;
+///
+///     assert_eq!(*odds_sum.lock().await, 25);
+///     assert_eq!(*evens_sum.lock().await, 30);
+/// });
+/// ```
 #[derive(Debug)]
 pub struct Pipeline {
     synchronizer: Arc<Synchronizer>,
+    producers: JoinSet<()>,
     stage_workers: JoinSet<()>,
     signal_txs: HashMap<String, Sender<StageWorkerSignal>>,
 }
@@ -177,15 +253,10 @@ impl Pipeline {
     /// Create a new pipeline using the list of pipe names.
     ///
     /// Using the names, an instance of [Pipes] will also be created which can be used to create
-    /// the I/O objects for each pipe. These objects can be given to [Pipeline::register_stage] calls
+    /// the I/O objects for each pipe. These objects can be given to [Pipeline::register_branching] calls
     /// which tell the pipeline to connect that pipe to the stage worker being registered.
     ///
     /// Providing no names will result in a pipeline that can't transfer any data.
-    ///
-    /// # Examples
-    ///
-    /// TODO
-    ///
     pub fn from_pipes<S: AsRef<str>>(names: Vec<S>) -> (Self, Pipes) {
         let mut sync = Synchronizer::default();
 
@@ -211,6 +282,7 @@ impl Pipeline {
             Self {
                 synchronizer: sync.clone(),
                 stage_workers: JoinSet::default(),
+                producers: JoinSet::default(),
                 signal_txs: HashMap::new(),
             },
             Pipes {
@@ -220,14 +292,27 @@ impl Pipeline {
         )
     }
 
-    /// Wait for all stage workers in the pipeline to finish.
+    /// Wait for the pipeline to complete.
     ///
-    /// Once all workers are done running, send the [StageWorkerSignal::TERMINATE] signal to all the workers.
+    /// Once the pipeline is complete, a [StageWorkerSignal::TERMINATE] is sent to to all the workers.
+    ///
+    /// A pipeline progresses to completion by doing the following:
+    ///   1. Wait for all "producers" to complete while also progressing stage workers
+    ///   2. Wait for either all the stage workers to complete, or wait for the internal synchronizer to notify
+    ///      of completion (i.e. there's no more data flowing through the pipeline)
+    ///
+    /// Step 1 implies that if the producers never finish, the pipeline will run forever. See
+    /// [Pipeline::register_producer] for more info.
     pub async fn wait(mut self) {
-        let workers = &mut self.stage_workers;
+        let (workers_to_progress, workers_to_finish) = atomic_mut_cloned(self.stage_workers);
 
-        let check_workers_completed = async {
-            while let Some(result) = workers.join_next().await {
+        let wait_for_producers = async {
+            while let Some(result) = self.producers.join_next().await {
+                Self::check_join_result(&result);
+            }
+        };
+        let wait_for_workers = |workers: Arc<Mutex<JoinSet<()>>>| async move {
+            while let Some(result) = workers.lock().await.join_next().await {
                 Self::check_join_result(&result);
             }
         };
@@ -241,22 +326,144 @@ impl Pipeline {
             }
         };
 
+        // Effectively make progress until all producers are done.
+        // We do this to prevent the synchronizer from causing the pipeline to shutdown too early.
+        select! {
+            _ = wait_for_producers => {},
+            _ = wait_for_workers(workers_to_progress), if !workers_to_progress.lock().await.is_empty() => {},
+        }
+
         // If either the synchronizer determines we're done, or all workers completed, we're done
         select! {
-            _ = check_workers_completed => {},
+            _ = wait_for_workers(workers_to_finish) => {},
             _ = check_sync_completed => {},
         }
     }
 
-    /// Register a new stage in the pipeline.
+    /// Register a new stage in the pipeline that produces values and writes them into a pipe.
     ///
-    /// This will create a "stage worker" that will create asynchronous tasks for each input received from
-    /// the connected pipe reader(s).
-    pub fn register_stage<I, O, F, Fut>(
+    /// The producer will continue producing values until the user-provided task function returns `None`.
+    /// This means that it is possible to create an infinite stream of values by simply never returning `None`.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - For debugging purposes; provide an identifying string for this stage.
+    /// * `writer` - Created by [Pipes::create_io], where produced output is written to.
+    /// * `task_definition` - An async function that when executed produces a single output value.
+    ///
+    /// If the output value returned by the task definition is `Some(...)`, it is written to
+    /// the provided pipe. Otherwise, if the output value is `None`, the producer terminates.
+    pub fn register_producer<O, F, Fut>(
         &mut self,
         name: impl Into<String>,
-        inputs: PipeReader<I>,
-        outputs: Vec<PipeWriter<O>>,
+        writer: PipeWriter<O>,
+        task_definition: F,
+    ) where
+        O: Send + 'static,
+        F: FnOnce() -> Fut + Clone + Send + 'static,
+        Fut: Future<Output = Option<O>> + Send + 'static,
+    {
+        self.register_branching_producer(name, vec![writer], || async move {
+            task_definition().await.map(|t| vec![Some(t)])
+        });
+    }
+
+    /// Register a new stage in the pipeline that produces multiple values and writes them into their
+    /// respective pipe.
+    ///
+    /// The producer will continue producing values until the user-provided task function returns `None`.
+    /// This means that it is possible to create an infinite stream of values by simply never returning `None`.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - for debugging purposes; provide an identifying string for this stage.
+    /// * `writers` - created by [Pipes::create_io], where produced outputs are written to.
+    ///   The position of each output in the returned vector maps directly to the position of the writer
+    ///   in the `writers` vector provided.
+    /// * `task_definition` - an async function that when executed produces a list of output values.
+    ///
+    /// If the output returned by the task definition is `Some(vec![...])` each value in the vector is
+    /// written to the respective pipe. Otherwise, if the output value is `None`, the producer terminates.
+    pub fn register_branching_producer<O, F, Fut>(
+        &mut self,
+        _name: impl Into<String>,
+        writers: Vec<PipeWriter<O>>,
+        task_definition: F,
+    ) where
+        O: Send + 'static,
+        F: FnOnce() -> Fut + Clone + Send + 'static,
+        Fut: Future<Output = Option<Vec<Option<O>>>> + Send + 'static,
+    {
+        self.producers.spawn(async move {
+            loop {
+                let task = task_definition.clone();
+                let writers = writers.clone();
+
+                if let Some(results) = task().await {
+                    Self::write_results(writers, results).await;
+                } else {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Register a new stage in the pipeline that operates on incoming data and writes the result to a single output
+    /// pipe.
+    ///
+    /// This effectively provides a means to do a "mapping" transformation on incoming data, with an additional
+    /// capability to filter it by returning `None` in the task definition.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - for debugging purposes; provide an identifying string for this stage.
+    /// * `reader` - Created by [Pipes::create_io], where incoming data is read from.
+    /// * `writer` - Created by [Pipes::create_io], where the task's output is written to.
+    /// * `task_definition` - An async function that operates on input received from the `reader` and returns
+    ///   an output that is written to the `writer`.
+    ///
+    /// If the output returned by the task definition is `Some(...)`, that value will be written.
+    /// Otherwise, if the output value is `None`, that value will not be written.
+    pub fn register<I, O, F, Fut>(
+        &mut self,
+        name: impl Into<String>,
+        reader: PipeReader<I>,
+        writer: PipeWriter<O>,
+        task_definition: F,
+    ) where
+        I: Send + 'static,
+        O: Send + 'static,
+        F: FnOnce(I) -> Fut + Clone + Send + 'static,
+        Fut: Future<Output = Option<O>> + Send + 'static,
+    {
+        self.register_branching(name, reader, vec![writer], |value: I| async move {
+            vec![task_definition(value).await]
+        });
+    }
+
+    /// Register a new stage in the pipeline that operates on reads incoming data and writes the results to its
+    /// respective output pipe.
+    ///
+    /// This effectively provides a means to do a "mapping" transformation on incoming data, with an additional
+    /// capability to filter it by returning `None` in the task definition.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - for debugging purposes; provide an identifying string for this stage.
+    /// * `reader` - Created by [Pipes::create_io], where incoming data is read from.
+    /// * `writer` - Created by [Pipes::create_io], where the task's output is written to.
+    ///   The position of each output in the returned vector maps directly to the position of the writer
+    ///   in the `writers` vector provided.
+    /// * `task_definition` - An async function that operates on input received from the `reader` and returns
+    ///   a list of outputs where each is written to its respective `writer`.
+    ///
+    /// For each output, if the task definition returns `Some(...)`, that value will be written.
+    /// Otherwise, if it is `None`, that value will not be written.
+    pub fn register_branching<I, O, F, Fut>(
+        &mut self,
+        name: impl Into<String>,
+        reader: PipeReader<I>,
+        writers: Vec<PipeWriter<O>>,
         task_definition: F,
     ) where
         I: Send + 'static,
@@ -273,10 +480,40 @@ impl Pipeline {
             .spawn(Self::new_stage_worker(StageWorker {
                 name,
                 signal_rx,
-                inputs,
-                outputs,
+                reader,
+                writers,
                 task_definition,
             }));
+    }
+
+    /// Register a new stage in the pipeline that consumes incoming data from a pipe.
+    ///
+    /// This acts as a "leaf" stage where the data flowing through the pipeline stops flowing at.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - for debugging purposes; provide an identifying string for this stage.
+    /// * `reader` - Created by [Pipes::create_io], where incoming data is read from.
+    /// * `writer` - Created by [Pipes::create_io], where the task's output is written to.
+    /// * `task_definition` - An async function that operates on input received from the `reader` and returns
+    ///   an output that is written to the `writer`.
+    ///
+    /// If the output returned by the task definition is `Some(...)`, that value will be written.
+    /// Otherwise, if the output value is `None`, that value will not be written.
+    pub fn register_consumer<I, F, Fut>(
+        &mut self,
+        name: impl Into<String>,
+        reader: PipeReader<I>,
+        task_definition: F,
+    ) where
+        I: Send + 'static,
+        F: FnOnce(I) -> Fut + Clone + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.register_branching(name, reader, vec![], |value: I| async move {
+            task_definition(value).await;
+            Vec::<Option<()>>::new()
+        });
     }
 
     async fn new_stage_worker<I, O, F, Fut>(mut worker: StageWorker<I, O, F, Fut>)
@@ -290,8 +527,8 @@ impl Pipeline {
         let StageWorker {
             name,
             signal_rx,
-            inputs,
-            outputs,
+            reader,
+            writers,
             task_definition,
         } = &mut worker;
 
@@ -300,24 +537,13 @@ impl Pipeline {
             // Reference to avoid moving into closures below
             select! {
                 // Start SWL
-                Some(input) = inputs.read() => {
-                    let consumed = inputs.consumed_callback();
-                    let outputs = outputs.clone();
+                Some(value) = reader.read() => {
+                    let consumed = reader.consumed_callback();
+                    let writers = writers.clone();
                     let task = task_definition.clone();
 
                     tasks.spawn(async move {
-                        let results = task(input).await;
-                        for (i, value) in results.into_iter().enumerate() {
-                            if let Some(result) = value {
-                                outputs
-                                    .get(i)
-                                    .expect(
-                                        "produced output count does not equal output pipe count",
-                                    )
-                                    .write(result)
-                                    .await;
-                            }
-                        }
+                        Self::write_results(writers, task(value).await).await;
 
                         // Mark input as consumed *after* writing outputs
                         // (avoids false positive of completed pipeline)
@@ -326,7 +552,7 @@ impl Pipeline {
                 }
 
                 // Join tasks to check for errors
-                Some(result) = tasks.join_next() => {
+                Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                     Self::check_join_result(&result);
                 }
 
@@ -341,6 +567,18 @@ impl Pipeline {
         }
 
         tasks.shutdown().await;
+    }
+
+    async fn write_results<O>(writers: Vec<PipeWriter<O>>, results: Vec<Option<O>>) {
+        for (i, value) in results.into_iter().enumerate() {
+            if let Some(result) = value {
+                writers
+                    .get(i)
+                    .expect("len(results) != len(writers)")
+                    .write(result)
+                    .await;
+            }
+        }
     }
 
     fn check_join_result<T>(result: &Result<T, JoinError>) {
@@ -361,9 +599,8 @@ mod tests {
     use std::time::Duration;
 
     use tokio::join;
-    use tokio::sync::Mutex;
 
-    use crate::{PipeWriter, Pipeline, StageWorkerSignal};
+    use crate::{atomic_mut_cloned, PipeWriter, Pipeline, StageWorkerSignal};
 
     #[test]
     fn test_pipeline_from_no_pipes_succeeds() {
@@ -406,12 +643,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stage_worker_producer() {
+        let value = Some("hello!".to_string());
+        let wk_value = value.clone();
+
+        let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["pipe"]);
+        let (w, mut r) = pipes.create_io("pipe").unwrap();
+
+        let (written, wk_written) = atomic_mut_cloned(false);
+        pipeline.register_producer("test-stage", w, || async move {
+            let mut wk_written = wk_written.lock().await;
+            if !*wk_written {
+                *wk_written = true;
+                wk_value
+            } else {
+                None
+            }
+        });
+
+        pipeline.wait().await;
+
+        assert!(*written.lock().await, "value was not handled by worker!");
+        assert_eq!(r.read().await, value);
+    }
+
+    #[tokio::test]
+    async fn test_stage_worker_consumer() {
+        let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["pipe"]);
+        let (w, r) = pipes.create_io("pipe").unwrap();
+
+        let (written, wk_written) = atomic_mut_cloned(false);
+        pipeline.register_consumer("test-stage", r, |n: usize| async move {
+            assert_eq!(n, 3);
+            *wk_written.lock().await = true;
+        });
+
+        w.write(3).await;
+        pipeline.wait().await;
+
+        assert!(*written.lock().await, "value was not handled by worker!");
+    }
+
+    #[tokio::test]
+    async fn test_stage_worker_single_output() {
+        let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["first", "second"]);
+        let (first_w, first_r) = pipes.create_io("first").unwrap();
+        let (second_w, second_r) = pipes.create_io("second").unwrap();
+
+        let (written, wk_written) = atomic_mut_cloned(false);
+        pipeline.register("test-stage", first_r, second_w, |n: usize| async move {
+            Some(n + 1)
+        });
+        pipeline.register_branching("test-stage", second_r, vec![], |n: usize| async move {
+            assert_eq!(n, 2);
+            *wk_written.lock().await = true;
+            Vec::<Option<()>>::new()
+        });
+
+        first_w.write(1).await;
+        pipeline.wait().await;
+
+        assert!(*written.lock().await, "value was not handled by worker!");
+    }
+
+    #[tokio::test]
     #[should_panic]
     async fn test_stage_worker_propagates_task_panic() {
         let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["pipe"]);
         let (w, r) = pipes.create_io("pipe").unwrap();
 
-        pipeline.register_stage(
+        pipeline.register_branching(
             "test-stage",
             r,
             Vec::<PipeWriter<Option<()>>>::new(),
@@ -426,7 +727,7 @@ mod tests {
         let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["pipe"]);
         let (w, r) = pipes.create_io("pipe").unwrap();
 
-        pipeline.register_stage(
+        pipeline.register_branching(
             "test-stage",
             r,
             Vec::<PipeWriter<Option<()>>>::new(),

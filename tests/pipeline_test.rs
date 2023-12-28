@@ -1,13 +1,4 @@
-use std::sync::Arc;
-
-use tokio::sync::Mutex;
-
-use plumber::Pipeline;
-
-fn atomic_value<T>(initial_value: T) -> (Arc<Mutex<T>>, Arc<Mutex<T>>) {
-    let value = Arc::new(Mutex::new(initial_value));
-    (value.clone(), value)
-}
+use plumber::{atomic_mut, atomic_mut_cloned, Pipeline};
 
 /// Check that a simple, one-stage, linear pipeline can be created and can transfer data from a pipe's
 /// writer (start) to its reader (end).
@@ -23,8 +14,8 @@ async fn simple_linear_pipeline() {
 
     let (writer, reader) = pipes.create_io(pipe).unwrap();
 
-    let (written, worker_written) = atomic_value(false);
-    pipeline.register_stage("simple", reader, vec![], |value: usize| async move {
+    let (written, worker_written) = atomic_mut_cloned(false);
+    pipeline.register_branching("simple", reader, vec![], |value: usize| async move {
         assert_eq!(value, 5);
         *worker_written.lock().await = true;
         Vec::<Option<()>>::new()
@@ -53,13 +44,13 @@ async fn complex_linear_pipeline() {
     let (three_w, three_r) = pipes.create_io("three").unwrap();
     let (four_w, four_r) = pipes.create_io("four").unwrap();
 
-    let (written, worker_written) = atomic_value(false);
+    let (written, worker_written) = atomic_mut_cloned(false);
 
-    pipeline.register_stage("complex0", one_r, vec![two_w], |value: usize| async move {
+    pipeline.register_branching("complex0", one_r, vec![two_w], |value: usize| async move {
         assert_eq!(value, 1);
         vec![Some(value + 1)]
     });
-    pipeline.register_stage(
+    pipeline.register_branching(
         "complex1",
         two_r,
         vec![three_w],
@@ -68,7 +59,7 @@ async fn complex_linear_pipeline() {
             vec![Some(value + 2)]
         },
     );
-    pipeline.register_stage(
+    pipeline.register_branching(
         "complex2",
         three_r,
         vec![four_w],
@@ -77,7 +68,7 @@ async fn complex_linear_pipeline() {
             vec![Some(value + 3)]
         },
     );
-    pipeline.register_stage("complex3", four_r, vec![], |value: usize| async move {
+    pipeline.register_branching("complex3", four_r, vec![], |value: usize| async move {
         assert_eq!(value, 7);
         *worker_written.lock().await = true;
         Vec::<Option<()>>::new()
@@ -106,10 +97,10 @@ async fn cyclic_pipeline() {
     let (two_w, two_r) = pipes.create_io("two").unwrap();
     let (three_w, three_r) = pipes.create_io("three").unwrap();
 
-    let (first_passed, cyclic0_first_passed) = atomic_value(false);
-    let (written, worker_written) = atomic_value(false);
+    let (first_passed, cyclic0_first_passed) = atomic_mut_cloned(false);
+    let (written, worker_written) = atomic_mut_cloned(false);
 
-    pipeline.register_stage("cyclic0", one_r, vec![two_w], |value: usize| async move {
+    pipeline.register_branching("cyclic0", one_r, vec![two_w], |value: usize| async move {
         if !*cyclic0_first_passed.lock().await {
             assert_eq!(value, 0);
         } else {
@@ -119,7 +110,7 @@ async fn cyclic_pipeline() {
     });
 
     let worker_one_w = one_w.clone();
-    pipeline.register_stage(
+    pipeline.register_branching(
         "cyclic1",
         two_r,
         vec![worker_one_w, three_w],
@@ -135,7 +126,7 @@ async fn cyclic_pipeline() {
             }
         },
     );
-    pipeline.register_stage("cyclic2", three_r, vec![], |value: usize| async move {
+    pipeline.register_branching("cyclic2", three_r, vec![], |value: usize| async move {
         assert_eq!(value, 4);
         *worker_written.lock().await = true;
         Vec::<Option<()>>::new()
@@ -168,7 +159,7 @@ async fn branching_pipeline() {
     let (one_c_w, one_c_r) = pipes.create_io("OneC").unwrap();
     let (two_w, two_r) = pipes.create_io("Two").unwrap();
 
-    pipeline.register_stage(
+    pipeline.register_branching(
         "branch0",
         input_r,
         vec![one_a_w, one_b_w, one_c_w],
@@ -179,7 +170,7 @@ async fn branching_pipeline() {
     );
 
     let w1a_two_w = two_w.clone();
-    pipeline.register_stage(
+    pipeline.register_branching(
         "branch1a",
         one_a_r,
         vec![w1a_two_w],
@@ -189,7 +180,7 @@ async fn branching_pipeline() {
         },
     );
     let w1b_two_w = two_w.clone();
-    pipeline.register_stage(
+    pipeline.register_branching(
         "branch1b",
         one_b_r,
         vec![w1b_two_w],
@@ -199,7 +190,7 @@ async fn branching_pipeline() {
         },
     );
     let w1c_two_w = two_w.clone();
-    pipeline.register_stage(
+    pipeline.register_branching(
         "branch1c",
         one_c_r,
         vec![w1c_two_w],
@@ -209,9 +200,9 @@ async fn branching_pipeline() {
         },
     );
 
-    let total = Arc::new(Mutex::new(0));
+    let total = atomic_mut(0);
     let worker_total = total.clone();
-    pipeline.register_stage("branch2", two_r, vec![], |value: usize| async move {
+    pipeline.register_branching("branch2", two_r, vec![], |value: usize| async move {
         *worker_total.lock().await += value;
         Vec::<Option<()>>::new()
     });
