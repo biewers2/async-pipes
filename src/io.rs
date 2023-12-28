@@ -8,7 +8,7 @@ use crate::sync;
 
 /// Defines an end to a pipe that allows data to be received from.
 ///
-/// Provide this to [crate::Pipeline::register_stage] as the input for that stage.
+/// Provide this to [crate::Pipeline::register_branching] as the input for that stage.
 #[derive(Debug)]
 pub struct PipeReader<T> {
     pipe_id: String,
@@ -52,7 +52,7 @@ impl<T> PipeReader<T> {
 
 /// Defines an end to a pipe that allows data to be sent through.
 ///
-/// Provide this to [crate::Pipeline::register_stage] as an output for a stage.
+/// Provide this to [crate::Pipeline::register_branching] as an output for a stage.
 #[derive(Debug)]
 pub struct PipeWriter<T> {
     pipe_id: String,
@@ -86,7 +86,7 @@ impl<T> PipeWriter<T> {
     }
 
     /// Increment the task count for this pipe and then send the value through the channel.
-    pub async fn write(&self, value: T) {
+    pub(crate) async fn write(&self, value: T) {
         self.synchronizer.started(&self.pipe_id).await;
         self.tx
             .send(value)
