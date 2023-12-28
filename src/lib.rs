@@ -1,3 +1,60 @@
+//!
+//! Plumber provides a simple way to create high-throughput, in-memory pipelines for data processing.
+//!
+//! ```
+//! use std::sync::Arc;
+//! use tokio::sync::Mutex;
+//! use plumber::Pipeline;
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     // Create the pipeline from a list of pipe names.
+//!     let (mut pipeline, mut pipes) =
+//!         Pipeline::from_pipes(vec!["MapInput", "MapToReduce", "ReduceToLog"]);
+//!
+//!     // We create "writers" (*_w) and "readers" (*_r) to transfer data
+//!     let (map_input_w, map_input_r) = pipes.create_io("MapInput").unwrap();
+//!     let (map_to_reduce_w, map_to_reduce_r) = pipes.create_io("MapToReduce").unwrap();
+//!
+//!     // After creating the pipes, stage workers are registered in the pipeline.
+//!     pipeline.register_stage(
+//!         "MapStage",
+//!         map_input_r,
+//!         vec![map_to_reduce_w],
+//!         |value: String| async move {
+//!             let new_value = format!("{}!", value);
+//!             vec![Some(new_value)]
+//!         },
+//!     );
+//!
+//!     // Variables can be updated by a task by wrapping it in a `Mutex` (to make it mutable)
+//!     // and then in an `Arc` (for data ownership between more than one thread).
+//!     let total_count = Arc::new(Mutex::new(0));
+//!     let reduce_total_count = total_count.clone();
+//!
+//!     pipeline.register_stage(
+//!         "ReduceStage",
+//!         map_to_reduce_r,
+//!         vec![],
+//!         |value: String| async move {
+//!             *reduce_total_count.lock().await += value.len();
+//!             Vec::<Option<()>>::new()
+//!         },
+//!     );
+//!
+//!     // Provide the pipeline with initial data, and then wait on the pipeline to complete.
+//!     for value in ["a", "bb", "ccc"] {
+//!         map_input_w.write(value.to_string()).await;
+//!     }
+//!     pipeline.wait().await;
+//!
+//!     // We see that after the data goes through our map and reduce stages,
+//!     // we effectively get this: `len("a!") + len("bb!") + len("ccc!") = 9`
+//!     assert_eq!(*total_count.lock().await, 9);
+//! }
+//! ```
+//!
+
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
@@ -18,10 +75,19 @@ pub(crate) mod sync;
 ///
 /// Useful for interrupting the natural workflow to tell it something.
 enum StageWorkerSignal {
+    /// For now, this is a placeholder signal and marked as dead code.
+    ///
+    /// This is to avoid a compiler error in [Pipeline::new_stage_worker] where the loop
+    /// complains about never having another iteration due to all other branches breaking
+    /// within the `select!`.
+    #[allow(dead_code)]
     Ping,
+
+    /// Used to tell stage workers to finish immediately without waiting for remaining tasks to end.
     Terminate,
 }
 
+/// Simple data structure to hold information about a stage worker.
 struct StageWorker<
     I: Send + 'static,
     O: Send + 'static,
@@ -44,16 +110,16 @@ struct StageWorker<
 /// ```
 /// use plumber::{Pipeline, PipeReader, Pipes, PipeWriter};
 ///
-/// // [pipes] is mutable so it can give ownership of values to the I/O objects produced in [Pipes::create_io].
-/// let (pipeline, mut pipes): (Pipeline, Pipes) = Pipeline::from_pipes(vec!["a", "b", "c"]);
+/// // `pipes` is mutable so it can give ownership of values to the I/O objects produced in `Pipes::create_io`
+/// let (_pipeline, mut pipes): (Pipeline, Pipes) = Pipeline::from_pipes(vec!["a", "b", "c"]);
 ///
 /// let pipe_io = pipes.create_io::<String>("a");
 /// assert!(pipe_io.is_some());
 ///
-/// // A tuple is returned containing the I/O objects.
+/// // A tuple is returned containing the I/O objects
 /// let (w, r): (PipeWriter<String>, PipeReader<String>) = pipe_io.unwrap();
 ///
-/// // [None] is returned if the pipe name doesn't exist
+/// // `None` is returned if the pipe name doesn't exist
 /// assert!(pipes.create_io::<String>("d").is_none());
 /// ```
 #[derive(Debug)]
@@ -76,7 +142,6 @@ impl Pipes {
     ///
     /// See [Pipes] for examples.
     ///
-    /// ```
     pub fn create_io<T>(
         &mut self,
         name: impl AsRef<str>,
@@ -156,7 +221,7 @@ impl Pipeline {
 
     /// Wait for all stage workers in the pipeline to finish.
     ///
-    /// Once all workers are done running, send the `TERMINATE` signal to all the workers.
+    /// Once all workers are done running, send the [StageWorkerSignal::TERMINATE] signal to all the workers.
     pub async fn wait(mut self) {
         let workers = &mut self.stage_workers;
 
@@ -166,7 +231,7 @@ impl Pipeline {
         };
 
         let check_sync_completed = async {
-            while !self.synchronizer.completed() {}
+            while !self.synchronizer.completed().await {}
 
             for tx in self.signal_txs.values() {
                 tx.send(StageWorkerSignal::Terminate)
@@ -257,7 +322,7 @@ impl Pipeline {
 
                         // Mark input as consumed *after* writing outputs
                         // (avoids false positive of completed pipeline)
-                        consumed();
+                        consumed().await;
                     });
                 }
             };
@@ -295,8 +360,8 @@ mod tests {
         assert_eq!(pipes.names_to_ids.len(), 0);
     }
 
-    #[test]
-    fn test_pipeline_from_pipes_succeeds() {
+    #[tokio::test]
+    async fn test_pipeline_from_pipes_succeeds() {
         let mut expected_names = vec!["start", "middle", "end"];
         expected_names.sort();
 
@@ -314,7 +379,7 @@ mod tests {
         assert!(Arc::ptr_eq(&pipeline.synchronizer, &pipes.synchronizer));
         for name in expected_names {
             let id = pipes.names_to_ids.get(name).unwrap();
-            assert_eq!(pipes.synchronizer.get(id), 0);
+            assert_eq!(pipes.synchronizer.get(id).await, 0);
         }
     }
 

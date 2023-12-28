@@ -1,8 +1,11 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::{sync, Pipeline};
+use crate::sync;
+use crate::Pipeline;
 
 /// Defines an end to a pipe that allows data to be received from.
 ///
@@ -27,10 +30,12 @@ impl<T> PipeReader<T> {
         }
     }
 
-    pub(crate) fn consumed_callback(&self) -> impl FnOnce() {
+    pub(crate) fn consumed_callback(
+        &self,
+    ) -> impl FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let id = self.pipe_id.clone();
         let sync = self.synchronizer.clone();
-        move || sync.ended(id)
+        || Box::pin(async move { sync.ended(id).await })
     }
 
     pub(crate) async fn read(&mut self) -> Option<T> {
@@ -72,7 +77,7 @@ impl<T> PipeWriter<T> {
     }
 
     pub async fn write(&self, value: T) {
-        self.synchronizer.started(&self.pipe_id);
+        self.synchronizer.started(&self.pipe_id).await;
         self.tx
             .send(value)
             .await
@@ -89,12 +94,12 @@ mod tests {
     use crate::sync::Synchronizer;
     use crate::PipeReader;
 
-    #[test]
-    fn test_input_consumed_callback_updates_sync() {
+    #[tokio::test]
+    async fn test_input_consumed_callback_updates_sync() {
         let id = "pipe-id";
         let mut sync = Synchronizer::default();
         sync.register(id);
-        sync.started_many(id, 4);
+        sync.started_many(id, 4).await;
 
         let sync = Arc::new(sync);
         let (_, rx) = channel::<()>(1);
@@ -102,8 +107,8 @@ mod tests {
 
         let callback = input.consumed_callback();
 
-        assert_eq!(sync.get(id), 4);
-        callback();
-        assert_eq!(sync.get(id), 3);
+        assert_eq!(sync.get(id).await, 4);
+        callback().await;
+        assert_eq!(sync.get(id).await, 3);
     }
 }
