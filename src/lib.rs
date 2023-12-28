@@ -14,10 +14,10 @@ use crate::sync::Synchronizer;
 mod io;
 pub(crate) mod sync;
 
-/// Signals sent to workers.
+/// Signals sent to stage workers.
 ///
-/// Useful for interrupting the natural worker workflow to tell it something.
-enum WorkerSignal {
+/// Useful for interrupting the natural workflow to tell it something.
+enum StageWorkerSignal {
     Ping,
     Terminate,
 }
@@ -29,7 +29,7 @@ struct StageWorker<
     Fut: Future<Output = Vec<Option<O>>> + Send + 'static,
 > {
     name: String,
-    signal_rx: Receiver<WorkerSignal>,
+    signal_rx: Receiver<StageWorkerSignal>,
     inputs: PipeReader<I>,
     outputs: Vec<PipeWriter<O>>,
     task_definition: F,
@@ -103,15 +103,15 @@ impl Pipes {
 #[derive(Debug)]
 pub struct Pipeline {
     synchronizer: Arc<Synchronizer>,
-    workers: JoinSet<()>,
-    signal_txs: HashMap<String, Sender<WorkerSignal>>,
+    stage_workers: JoinSet<()>,
+    signal_txs: HashMap<String, Sender<StageWorkerSignal>>,
 }
 
 impl Pipeline {
     /// Create a new pipeline using the list of pipe names.
     ///
     /// Using the names, an instance of [Pipes] will also be created which can be used to create
-    /// the I/O objects for each pipe. These objects can be given to [Pipeline::register_worker] calls
+    /// the I/O objects for each pipe. These objects can be given to [Pipeline::register_stage] calls
     /// which tell the pipeline to connect that pipe to the stage worker being registered.
     ///
     /// Providing no names will result in a pipeline that can't transfer any data.
@@ -120,7 +120,7 @@ impl Pipeline {
     ///
     /// TODO
     ///
-    pub fn from_pipes<S: Into<String>>(names: Vec<S>) -> (Self, Pipes) {
+    pub fn from_pipes<S: AsRef<str>>(names: Vec<S>) -> (Self, Pipes) {
         let mut sync = Synchronizer::default();
 
         // Construct this before creating the pipe I/O objects
@@ -133,7 +133,7 @@ impl Pipeline {
         //
         let mut names_to_ids = HashMap::new();
         for name in names {
-            let name = name.into();
+            let name = name.as_ref().to_string();
             let id = format!("{}-{}", &name, uuid::Uuid::new_v4());
 
             sync.register(&id);
@@ -144,7 +144,7 @@ impl Pipeline {
         (
             Self {
                 synchronizer: sync.clone(),
-                workers: JoinSet::default(),
+                stage_workers: JoinSet::default(),
                 signal_txs: HashMap::new(),
             },
             Pipes {
@@ -158,7 +158,7 @@ impl Pipeline {
     ///
     /// Once all workers are done running, send the `TERMINATE` signal to all the workers.
     pub async fn wait(mut self) {
-        let workers = &mut self.workers;
+        let workers = &mut self.stage_workers;
 
         let check_workers_completed = async {
             // todo - log join results if failures
@@ -169,7 +169,7 @@ impl Pipeline {
             while !self.synchronizer.completed() {}
 
             for tx in self.signal_txs.values() {
-                tx.send(WorkerSignal::Terminate)
+                tx.send(StageWorkerSignal::Terminate)
                     .await
                     .expect("failed to send done signal")
             }
@@ -182,16 +182,16 @@ impl Pipeline {
         }
     }
 
-    /// Register a worker to handle data between pipes.
+    /// Register a new stage in the pipeline.
     ///
-    /// This is considered defining a "stage".
-    ///
-    pub fn register_worker<I, O, F, Fut>(
+    /// This will create a "stage worker" that will create asynchronous tasks for each input received from
+    /// the connected pipe reader(s).
+    pub fn register_stage<I, O, F, Fut>(
         &mut self,
         name: impl Into<String>,
         inputs: PipeReader<I>,
         outputs: Vec<PipeWriter<O>>,
-        worker_def: F,
+        task_definition: F,
     ) where
         I: Send + 'static,
         O: Send + 'static,
@@ -203,16 +203,17 @@ impl Pipeline {
         let (signal_tx, signal_rx) = channel(1);
         self.signal_txs.insert(name.clone(), signal_tx);
 
-        self.workers.spawn(Self::new_worker(StageWorker {
-            name,
-            signal_rx,
-            inputs,
-            outputs,
-            task_definition: worker_def,
-        }));
+        self.stage_workers
+            .spawn(Self::new_stage_worker(StageWorker {
+                name,
+                signal_rx,
+                inputs,
+                outputs,
+                task_definition,
+            }));
     }
 
-    async fn new_worker<I, O, F, Fut>(mut worker: StageWorker<I, O, F, Fut>)
+    async fn new_stage_worker<I, O, F, Fut>(mut worker: StageWorker<I, O, F, Fut>)
     where
         I: Send + 'static,
         O: Send + 'static,
@@ -269,8 +270,8 @@ impl Pipeline {
                 // Receive external signals
                 Some(signal) = signal_rx.recv() => {
                     match signal {
-                        WorkerSignal::Terminate => break,
-                        WorkerSignal::Ping => println!("Number of tasks for {}: {}", name, tasks.len())
+                        StageWorkerSignal::Terminate => break,
+                        StageWorkerSignal::Ping => println!("Number of tasks for {}: {}", name, tasks.len())
                     }
                 },
             }

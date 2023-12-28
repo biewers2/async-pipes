@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::sync;
+use crate::{sync, Pipeline};
 
 /// Defines an end to a pipe that allows data to be received from.
 ///
-/// Provide this to [Pipeline::register_worker] as the input for that stage.
+/// Provide this to [Pipeline::register_stage] as the input for that stage.
 #[derive(Debug)]
 pub struct PipeReader<T> {
     pipe_id: String,
@@ -40,7 +40,7 @@ impl<T> PipeReader<T> {
 
 /// Defines an end to a pipe that allows data to be sent through.
 ///
-/// Provide this to [Pipeline::register_worker] as an output for a stage.
+/// Provide this to [Pipeline::register_stage] as an output for a stage.
 #[derive(Debug)]
 pub struct PipeWriter<T> {
     pipe_id: String,
