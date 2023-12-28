@@ -5,6 +5,7 @@
 //! use std::sync::Arc;
 //! use tokio::sync::Mutex;
 //! use plumber::Pipeline;
+//! use plumber::atomic_mut;
 //!
 //! #[tokio::main]
 //! async fn main() {
@@ -17,35 +18,22 @@
 //!     let (map_to_reduce_w, map_to_reduce_r) = pipes.create_io("MapToReduce").unwrap();
 //!
 //!     // After creating the pipes, stage workers are registered in the pipeline.
-//!     pipeline.register_branching(
-//!         "MapStage",
-//!         map_input_r,
-//!         vec![map_to_reduce_w],
-//!         |value: String| async move {
-//!             let new_value = format!("{}!", value);
-//!             vec![Some(new_value)]
-//!         },
-//!     );
+//!     pipeline.register_inputs("Producer", map_input_w, vec!["a", "bb", "ccc"]);
 //!
-//!     // Variables can be updated by a task by wrapping it in a `Mutex` (to make it mutable)
-//!     // and then in an `Arc` (for data ownership between more than one thread).
-//!     let total_count = Arc::new(Mutex::new(0));
+//!     // We return an option to tell the stage whether to write `new_value` to the pipe or ignore it.
+//!     pipeline.register("MapStage", map_input_r, map_to_reduce_w, |value: &'static str| async move {
+//!         let new_value = format!("{}!", value);
+//!         Some(new_value)
+//!     });
+//!
+//!     // Variables can be updated in a task by wrapping it in a `Mutex` (to make it mutable)
+//!     // and then in an `Arc` (for data ownership across task executions).
+//!     let total_count = atomic_mut(0);
 //!     let reduce_total_count = total_count.clone();
+//!     pipeline.register_consumer("ReduceStage", map_to_reduce_r, |value: String| async move {
+//!         *reduce_total_count.lock().await += value.len();
+//!     });
 //!
-//!     pipeline.register_branching(
-//!         "ReduceStage",
-//!         map_to_reduce_r,
-//!         vec![],
-//!         |value: String| async move {
-//!             *reduce_total_count.lock().await += value.len();
-//!             Vec::<Option<()>>::new()
-//!         },
-//!     );
-//!
-//!     // Provide the pipeline with initial data, and then wait on the pipeline to complete.
-//!     for value in ["a", "bb", "ccc"] {
-//!         map_input_w.write(value.to_string()).await;
-//!     }
 //!     pipeline.wait().await;
 //!
 //!     // We see that after the data goes through our map and reduce stages,
@@ -202,6 +190,7 @@ impl Pipes {
 /// Creating a branching producer and two consumers for each branch.
 /// ```
 /// use plumber::atomic_mut;
+///
 /// tokio_test::block_on(async {
 ///     use plumber::{atomic_mut_cloned, Pipeline , Pipes };
 ///
@@ -338,6 +327,55 @@ impl Pipeline {
             _ = wait_for_workers(workers_to_finish) => {},
             _ = check_sync_completed => {},
         }
+    }
+
+    /// Register a set of inputs to be written to a provided pipe.
+    ///
+    /// This effectively creates a producer stage internally, looping over each input and writing it to
+    /// the pipe.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - For debugging purposes; provide an identifying string for this stage.
+    /// * `writer` - Created by [Pipes::create_io], where each input is written to.
+    /// * `inputs` - A list of inputs to write to the pipe.
+    ///
+    pub fn register_inputs<O: Send + 'static>(
+        &mut self,
+        name: impl Into<String>,
+        writer: PipeWriter<O>,
+        inputs: Vec<O>,
+    ) {
+        let iter = atomic_mut(inputs.into_iter());
+        self.register_branching_producer(name, vec![writer], || async move {
+            iter.lock().await.next().map(|input| vec![Some(input)])
+        });
+    }
+
+    /// Register a set of inputs to be written to a provided pipe.
+    ///
+    /// This effectively creates a producer stage internally, looping over each input and writing it to
+    /// the pipe.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - For debugging purposes; provide an identifying string for this stage.
+    /// * `writer` - Created by [Pipes::create_io], where each input is written to.
+    /// * `inputs` - A list of inputs to write to the pipe.
+    ///
+    pub fn register_branching_inputs<O: Send + 'static>(
+        &mut self,
+        name: impl Into<String>,
+        writers: Vec<PipeWriter<O>>,
+        inputs: Vec<Vec<O>>,
+    ) {
+        let iter = atomic_mut(inputs.into_iter());
+        self.register_branching_producer(name, writers, || async move {
+            iter.lock()
+                .await
+                .next()
+                .map(|is| is.into_iter().map(Some).collect())
+        });
     }
 
     /// Register a new stage in the pipeline that produces values and writes them into a pipe.
@@ -600,7 +638,7 @@ mod tests {
 
     use tokio::join;
 
-    use crate::{atomic_mut_cloned, PipeWriter, Pipeline, StageWorkerSignal};
+    use crate::{atomic_mut_cloned, Pipeline, StageWorkerSignal};
 
     #[test]
     fn test_pipeline_from_no_pipes_succeeds() {
@@ -694,10 +732,9 @@ mod tests {
         pipeline.register("test-stage", first_r, second_w, |n: usize| async move {
             Some(n + 1)
         });
-        pipeline.register_branching("test-stage", second_r, vec![], |n: usize| async move {
+        pipeline.register_consumer("test-stage", second_r, |n: usize| async move {
             assert_eq!(n, 2);
             *wk_written.lock().await = true;
-            Vec::<Option<()>>::new()
         });
 
         first_w.write(1).await;
@@ -712,12 +749,7 @@ mod tests {
         let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["pipe"]);
         let (w, r) = pipes.create_io("pipe").unwrap();
 
-        pipeline.register_branching(
-            "test-stage",
-            r,
-            Vec::<PipeWriter<Option<()>>>::new(),
-            |_: ()| async move { panic!("AHH!") },
-        );
+        pipeline.register_consumer("test-stage", r, |_: ()| async move { panic!("AHH!") });
         w.write(()).await;
         pipeline.wait().await;
     }
@@ -727,15 +759,10 @@ mod tests {
         let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["pipe"]);
         let (w, r) = pipes.create_io("pipe").unwrap();
 
-        pipeline.register_branching(
-            "test-stage",
-            r,
-            Vec::<PipeWriter<Option<()>>>::new(),
-            |_: ()| async move {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                panic!("worker did not terminate!");
-            },
-        );
+        pipeline.register_consumer("test-stage", r, |_: ()| async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            panic!("worker did not terminate!");
+        });
         w.write(()).await;
 
         let signaller = pipeline.signal_txs["test-stage"].clone();

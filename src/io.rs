@@ -86,7 +86,7 @@ impl<T> PipeWriter<T> {
     }
 
     /// Increment the task count for this pipe and then send the value through the channel.
-    pub async fn write(&self, value: T) {
+    pub(crate) async fn write(&self, value: T) {
         self.synchronizer.started(&self.pipe_id).await;
         self.tx
             .send(value)
