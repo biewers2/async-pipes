@@ -373,6 +373,54 @@ impl Pipeline {
         });
     }
 
+    /// Register a new stage in the pipeline that "flattens" data between pipes.
+    ///
+    /// This stage defines a worker that reads in a list of values from `from` and writes each value
+    /// to `to`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use async_pipes::Pipeline;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    /// let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["ListOfLists", "ListOfValues"]);
+    /// let (lol_w, lol_r) = pipes.create_io("ListOfLists").unwrap();
+    /// let (lov_w, lov_r) = pipes.create_io("ListOfValues").unwrap();
+    ///
+    /// pipeline.register_inputs("Producer", lol_w, vec![
+    ///     vec![1, 1, 1],
+    ///     vec![1, 1, 1],
+    ///     vec![1, 1, 1],
+    /// ]);
+    ///
+    /// // Flatten the list of lists into a single list and then find the sum.
+    /// pipeline.flatten(lol_r, lov_w);
+    ///
+    /// let sum = Arc::new(AtomicUsize::new(0));
+    /// let task_sum = sum.clone();
+    /// pipeline.register_consumer("Consumer", lov_r, |n: usize| async move {
+    ///     task_sum.fetch_add(n, Ordering::SeqCst);
+    /// });
+    ///
+    /// pipeline.wait().await;
+    ///
+    /// assert_eq!(sum.load(Ordering::Acquire), 9);
+    /// }
+    pub fn flatten<T: Send + 'static>(&mut self, mut from: PipeReader<Vec<T>>, to: PipeWriter<T>) {
+        self.stage_workers.spawn(async move {
+            while let Some(values) = from.read().await {
+                for value in values {
+                    to.write(value).await;
+                }
+                from.consumed_callback()();
+            }
+        });
+    }
+
     /// Register a new stage in the pipeline that operates on incoming data and writes the result to a single output
     /// pipe.
     ///
@@ -566,6 +614,7 @@ mod tests {
     use std::time::Duration;
 
     use tokio::join;
+    use tokio::sync::Mutex;
 
     use crate::{Pipeline, StageWorkerSignal};
 
@@ -610,7 +659,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stage_worker_producer() {
+    async fn test_stage_producer() {
         let value = Some("hello!".to_string());
         let task_value = value.clone();
 
@@ -635,7 +684,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stage_worker_consumer() {
+    async fn test_stage_consumer() {
         let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["pipe"]);
         let (w, r) = pipes.create_io("pipe").unwrap();
 
@@ -653,7 +702,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stage_worker_single_output() {
+    async fn test_stage_single_output() {
         let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["first", "second"]);
         let (first_w, first_r) = pipes.create_io("first").unwrap();
         let (second_w, second_r) = pipes.create_io("second").unwrap();
@@ -675,8 +724,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stage_flatten() {
+        let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["ListOfLists", "ListOfValues"]);
+        let (lol_w, lol_r) = pipes.create_io("ListOfLists").unwrap();
+        let (lov_w, lov_r) = pipes.create_io("ListOfValues").unwrap();
+
+        let word = Arc::new(Mutex::new(String::new()));
+        let task_word = word.clone();
+        pipeline.register_inputs(
+            "Producer",
+            lol_w,
+            vec![
+                vec!["Th", "i", "s "],
+                vec!["is "],
+                vec!["a ", "phr", "ase", "."],
+            ],
+        );
+        pipeline.flatten(lol_r, lov_w);
+        pipeline.register_consumer("Consumer", lov_r, |s: &'static str| async move {
+            let mut w = task_word.lock().await;
+            *w = format!("{}{}", w, s);
+        });
+
+        pipeline.wait().await;
+
+        assert_eq!(*word.lock().await, "This is a phrase.".to_string());
+    }
+
+    #[tokio::test]
     #[should_panic]
-    async fn test_stage_worker_propagates_task_panic() {
+    async fn test_stage_propagates_task_panic() {
         let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["pipe"]);
         let (w, r) = pipes.create_io("pipe").unwrap();
 
@@ -686,7 +763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stage_worker_signal_terminate() {
+    async fn test_stage_receives_signal_terminate() {
         let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["pipe"]);
         let (w, r) = pipes.create_io("pipe").unwrap();
 

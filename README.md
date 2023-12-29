@@ -54,4 +54,4 @@ async fn main() {
 
 ## Documentation
 
-WIP
+[Async Pipes - Docs.rs](https://docs.rs/async-pipes/0.1.0/async_pipes/)
