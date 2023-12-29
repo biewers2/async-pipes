@@ -60,7 +60,7 @@ pub struct PipeWriter<T> {
     tx: Sender<T>,
 }
 
-/// Manually implement [Clone] for [PipeWriter] over [T], as deriving [Clone]
+/// Manually implement [Clone] for [PipeWriter] over `T`, as deriving [Clone]
 /// Does not implement it over generic parameters.
 impl<T> Clone for PipeWriter<T> {
     fn clone(&self) -> Self {
