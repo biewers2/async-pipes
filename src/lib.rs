@@ -1,11 +1,11 @@
 //!
-//! Plumber provides a simple way to create high-throughput, in-memory pipelines for data processing.
+//! Async Pipes provides a simple way to create high-throughput, in-memory pipelines for data processing.
 //!
 //! ```
 //! use std::sync::Arc;
 //! use tokio::sync::Mutex;
-//! use plumber::Pipeline;
-//! use plumber::atomic_mut;
+//! use async_pipes::Pipeline;
+//! use async_pipes::atomic_mut;
 //!
 //! #[tokio::main]
 //! async fn main() {
@@ -101,7 +101,7 @@ struct StageWorker<
 /// Create three pipes and demonstrate how to acquire the I/O objects of a pipe by name.
 ///
 /// ```
-/// use plumber::{Pipeline, PipeReader, Pipes, PipeWriter};
+/// use async_pipes::{Pipeline, PipeReader, Pipes, PipeWriter};
 ///
 /// // `pipes` is mutable so it can give ownership of values to the I/O objects produced in `Pipes::create_io`
 /// let (_pipeline, mut pipes): (Pipeline, Pipes) = Pipeline::from_pipes(vec!["a", "b", "c"]);
@@ -156,10 +156,10 @@ impl Pipes {
 ///
 /// Creating a single producer and a single consumer.
 /// ```
-/// use plumber::atomic_mut;
+/// use async_pipes::atomic_mut;
 ///
 /// tokio_test::block_on(async {
-///     use plumber::{atomic_mut_cloned, Pipeline, PipeReader, Pipes, PipeWriter};
+///     use async_pipes::{atomic_mut_cloned, Pipeline, PipeReader, Pipes, PipeWriter};
 ///
 ///     let (mut pipeline, mut pipes): (Pipeline, Pipes) = Pipeline::from_pipes(vec!["pipe"]);
 ///     let (writer, reader) = pipes.create_io::<usize>("pipe").unwrap();
@@ -189,10 +189,10 @@ impl Pipes {
 ///
 /// Creating a branching producer and two consumers for each branch.
 /// ```
-/// use plumber::atomic_mut;
+/// use async_pipes::atomic_mut;
 ///
 /// tokio_test::block_on(async {
-///     use plumber::{atomic_mut_cloned, Pipeline , Pipes };
+///     use async_pipes::{atomic_mut_cloned, Pipeline , Pipes };
 ///
 ///     let (mut pipeline, mut pipes): (Pipeline, Pipes) = Pipeline::from_pipes(vec!["evens", "odds"]);
 ///     let (evens_w, evens_r) = pipes.create_io::<usize>("evens").unwrap();

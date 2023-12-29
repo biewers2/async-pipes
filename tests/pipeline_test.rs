@@ -1,4 +1,4 @@
-use plumber::{atomic_mut, atomic_mut_cloned, Pipeline};
+use async_pipes::{atomic_mut, atomic_mut_cloned, Pipeline};
 
 /// Check that a simple, one-stage, linear pipeline can be created and can transfer data from a pipe's
 /// writer (start) to its reader (end).
