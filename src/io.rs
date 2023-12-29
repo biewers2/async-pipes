@@ -1,5 +1,3 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -36,12 +34,10 @@ impl<T> PipeReader<T> {
     ///
     /// We use a callback function here so it can be passed and called in the task definition
     /// without having to give ownership of this reader to the task definition.
-    pub(crate) fn consumed_callback(
-        &self,
-    ) -> impl FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    pub(crate) fn consumed_callback(&self) -> impl FnOnce() {
         let id = self.pipe_id.clone();
         let sync = self.synchronizer.clone();
-        || Box::pin(async move { sync.ended(id).await })
+        move || sync.ended(id)
     }
 
     /// Receive the next value from the inner receiver.
@@ -87,7 +83,7 @@ impl<T> PipeWriter<T> {
 
     /// Increment the task count for this pipe and then send the value through the channel.
     pub(crate) async fn write(&self, value: T) {
-        self.synchronizer.started(&self.pipe_id).await;
+        self.synchronizer.started(&self.pipe_id);
         self.tx
             .send(value)
             .await
@@ -104,12 +100,12 @@ mod tests {
     use crate::sync::Synchronizer;
     use crate::PipeReader;
 
-    #[tokio::test]
-    async fn test_input_consumed_callback_updates_sync() {
+    #[test]
+    fn test_input_consumed_callback_updates_sync() {
         let id = "pipe-id";
         let mut sync = Synchronizer::default();
         sync.register(id);
-        sync.started_many(id, 4).await;
+        sync.started_many(id, 4);
 
         let sync = Arc::new(sync);
         let (_, rx) = channel::<()>(1);
@@ -117,8 +113,8 @@ mod tests {
 
         let callback = input.consumed_callback();
 
-        assert_eq!(sync.get(id).await, 4);
-        callback().await;
-        assert_eq!(sync.get(id).await, 3);
+        assert_eq!(sync.get(id), 4);
+        callback();
+        assert_eq!(sync.get(id), 3);
     }
 }

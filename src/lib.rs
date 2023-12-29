@@ -65,16 +65,19 @@
 //!
 //! After registering the stages, call [Pipeline::wait] to wait for the pipeline to finish.
 //! ```
-//! use async_pipes::{atomic_mut, atomic_mut_cloned, Pipeline};
+//! use async_pipes::Pipeline;
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["Transfer", "Counted"]);
+//!     use std::sync::Arc;
+//! use std::sync::atomic::{AtomicUsize, Ordering};
+//! let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["Transfer", "Counted"]);
 //!
 //!     let (transfer_writer, transfer_reader) = pipes.create_io::<String>("Transfer").unwrap();
 //!     let (counted_writer, counted_reader) = pipes.create_io::<usize>("Counted").unwrap();
 //!
-//!     let (sum, summer_sum) = atomic_mut_cloned(0);
+//!     let sum = Arc::new(AtomicUsize::new(0));
+//!     let summer_sum = sum.clone();
 //!
 //!     let inputs = vec!["a".to_string(), "abc".to_string()];
 //!     pipeline.register_inputs("Transfer", transfer_writer, inputs);
@@ -82,12 +85,12 @@
 //!         Some(value.len())
 //!     });
 //!     pipeline.register_consumer("Summer", counted_reader, |value: usize| async move {
-//!         *summer_sum.lock().await += value
+//!         summer_sum.fetch_add(value, Ordering::SeqCst);
 //!     });
 //!
 //!     pipeline.wait().await;
 //!
-//!     assert_eq!(*sum.lock().await, 4);
+//!     assert_eq!(sum.load(Ordering::Acquire), 4);
 //! }
 //! ```
 //!
@@ -134,11 +137,14 @@
 //!
 //! ```
 //! use async_pipes::Pipeline;
-//! use async_pipes::atomic_mut_cloned;
 //!
 //! #[tokio::main]
 //! async fn main() {
 //!     // Create the pipeline from a list of pipe names.
+//! use std::sync::Arc;
+//! use std::sync::atomic::{AtomicUsize, Ordering};
+//! use tokio::sync::Mutex;
+//!
 //! let (mut pipeline, mut pipes) =
 //!         Pipeline::from_pipes(vec!["MapInput", "MapToReduce"]);
 //!
@@ -155,18 +161,21 @@
 //!         Some(new_value)
 //!     });
 //!
-//!     // Variables can be updated in a task by wrapping it in a `Mutex` (to make it mutable)
-//!     // and then in an `Arc` (for data ownership across task executions).
-//!     let (total_count, reduce_total_count) = atomic_mut_cloned(0);
+//!     // It's recommended to wrap large read-only data in an [Arc], as the closure is cloned
+//!     // on each execution (which means context values are too). It's required to do this if the
+//!     // value is mutable so the variable points to the same data.
+//!     let total_count = Arc::new(AtomicUsize::new(0));
+//!     let reduce_total_count = total_count.clone();
+//!
 //!     pipeline.register_consumer("ReduceStage", map_to_reduce_r, |value: String| async move {
-//!         *reduce_total_count.lock().await += value.len();
+//!         reduce_total_count.fetch_add(value.len(), Ordering::SeqCst);
 //!     });
 //!
 //!     pipeline.wait().await;
 //!
 //!     // We see that after the data goes through our map and reduce stages,
 //!     // we effectively get this: `len("a!") + len("bb!") + len("ccc!") = 9`
-//!     assert_eq!(*total_count.lock().await, 9);
+//!     assert_eq!(total_count.load(Ordering::Acquire), 9);
 //! }
 //! ```
 //!
@@ -179,7 +188,6 @@ use tokio::sync::mpsc::Receiver;
 
 pub use io::*;
 pub use pipeline::*;
-pub use util::*;
 
 mod io;
 mod pipeline;

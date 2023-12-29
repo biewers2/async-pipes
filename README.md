@@ -9,10 +9,6 @@ asynchronous runtime capabilities. This is done by this library providing the in
 asynchronous tasks and data transfer between the tasks so the developer only has to worry about the task-specific
 implementation for each stage in the pipeline.
 
-## Getting Started
-
-_WIP_
-
 #### Simple, Linear Pipeline Example
 
 ```rust

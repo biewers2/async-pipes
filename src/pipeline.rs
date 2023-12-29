@@ -1,14 +1,15 @@
-use crate::sync::Synchronizer;
-use crate::{
-    atomic_mut, atomic_mut_cloned, PipeReader, PipeWriter, StageWorker, StageWorkerSignal,
-};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+
 use tokio::select;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::Mutex;
-use tokio::task::{JoinError, JoinSet};
+use tokio::task::{yield_now, JoinError, JoinSet};
+
+use crate::sync::Synchronizer;
+use crate::util::{atomic_mut, atomic_mut_cloned};
+use crate::{PipeReader, PipeWriter, StageWorker, StageWorkerSignal};
 
 /// Provided by [Pipeline::from_pipes], used to create the I/O objects for each end of a pipe.
 ///
@@ -72,17 +73,19 @@ impl Pipes {
 ///
 /// Creating a single producer and a single consumer.
 /// ```
-/// use async_pipes::atomic_mut;
+/// use std::sync::Arc;
+/// use std::sync::atomic::{AtomicUsize, Ordering};
+/// use std::sync::atomic::Ordering::Acquire;
+/// use tokio::sync::Mutex;
+/// use async_pipes::{Pipeline, PipeReader, Pipes, PipeWriter};
 ///
 /// tokio_test::block_on(async {
-///     use async_pipes::{atomic_mut_cloned, Pipeline, PipeReader, Pipes, PipeWriter};
-///
-///     let (mut pipeline, mut pipes): (Pipeline, Pipes) = Pipeline::from_pipes(vec!["pipe"]);
-///     let (writer, reader) = pipes.create_io::<usize>("pipe").unwrap();
+///     let (mut pipeline, mut pipes): (Pipeline, Pipes) = Pipeline::from_pipes(vec!["Pipe"]);
+///     let (writer, reader) = pipes.create_io::<usize>("Pipe").unwrap();
 ///
 ///     // Produce values 1 through 10
-///     let count = atomic_mut(0);
-///     pipeline.register_producer("producer", writer, || async move {
+///     let count = Arc::new(Mutex::new(0));
+///     pipeline.register_producer("Producer", writer, || async move {
 ///         let mut count = count.lock().await;
 ///         if *count < 10 {
 ///             *count += 1;
@@ -92,29 +95,33 @@ impl Pipes {
 ///         }
 ///     });
 ///
-///     let (sum, wk_sum) = atomic_mut_cloned(0);
-///     pipeline.register_consumer("consumer", reader, |n: usize| async move {
-///         *wk_sum.lock().await += n;
+///     let sum = Arc::new(AtomicUsize::new(0));
+///     let task_sum = sum.clone();
+///     pipeline.register_consumer("Consumer", reader, |n: usize| async move {
+///         task_sum.fetch_add(n, Ordering::SeqCst);
 ///     });
 ///
 ///     pipeline.wait().await;
 ///
-///     assert_eq!(*sum.lock().await, 55);
+///     assert_eq!(sum.load(Acquire), 55);
 /// });
 /// ```
 ///
 /// Creating a branching producer and two consumers for each branch.
 /// ```
-/// use async_pipes::atomic_mut;
+/// use std::sync::Arc;
+/// use std::sync::atomic::{AtomicUsize, Ordering};
+/// use std::sync::atomic::Ordering::Acquire;
+/// use tokio::sync::Mutex;
+/// use async_pipes::{Pipeline , Pipes };
 ///
 /// tokio_test::block_on(async {
-///     use async_pipes::{atomic_mut_cloned, Pipeline , Pipes };
 ///
 ///     let (mut pipeline, mut pipes): (Pipeline, Pipes) = Pipeline::from_pipes(vec!["evens", "odds"]);
 ///     let (evens_w, evens_r) = pipes.create_io::<usize>("evens").unwrap();
 ///     let (odds_w, odds_r) = pipes.create_io::<usize>("odds").unwrap();
 ///
-///     let count = atomic_mut(0);
+///     let count = Arc::new(Mutex::new(0));
 ///     pipeline.register_branching_producer("producer", vec![evens_w, odds_w], || async move {
 ///         let mut count = count.lock().await;
 ///         if *count >= 10 {
@@ -131,19 +138,21 @@ impl Pipes {
 ///         Some(output)
 ///     });
 ///
-///     let (odds_sum, wk_odds_sum) = atomic_mut_cloned(0);
+///     let odds_sum = Arc::new(AtomicUsize::new(0));
+///     let task_odds_sum = odds_sum.clone();
 ///     pipeline.register_consumer("odds-consumer", odds_r, |n: usize| async move {
-///         *wk_odds_sum.lock().await += n;
+///         task_odds_sum.fetch_add(n, Ordering::SeqCst);
 ///     });
-///     let (evens_sum, wk_evens_sum) = atomic_mut_cloned(0);
+///     let evens_sum = Arc::new(AtomicUsize::new(0));
+///     let task_evens_sum = evens_sum.clone();
 ///     pipeline.register_consumer("evens-consumer", evens_r, |n: usize| async move {
-///         *wk_evens_sum.lock().await += n;
+///         task_evens_sum.fetch_add(n, Ordering::SeqCst);
 ///     });
 ///
 ///     pipeline.wait().await;
 ///
-///     assert_eq!(*odds_sum.lock().await, 25);
-///     assert_eq!(*evens_sum.lock().await, 30);
+///     assert_eq!(odds_sum.load(Acquire), 25);
+///     assert_eq!(evens_sum.load(Acquire), 30);
 /// });
 /// ```
 #[derive(Debug)]
@@ -222,7 +231,9 @@ impl Pipeline {
             }
         };
         let check_sync_completed = async {
-            while !self.synchronizer.completed().await {}
+            while !self.synchronizer.completed() {
+                yield_now().await
+            }
 
             for tx in self.signal_txs.values() {
                 tx.send(StageWorkerSignal::Terminate)
@@ -501,7 +512,7 @@ impl Pipeline {
 
                         // Mark input as consumed *after* writing outputs
                         // (avoids false positive of completed pipeline)
-                        consumed().await;
+                        consumed();
                     });
                 }
 
@@ -549,12 +560,14 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use std::ops::Deref;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering::{Acquire, Release};
     use std::sync::Arc;
     use std::time::Duration;
 
     use tokio::join;
 
-    use crate::{atomic_mut_cloned, Pipeline, StageWorkerSignal};
+    use crate::{Pipeline, StageWorkerSignal};
 
     #[test]
     fn test_pipeline_from_no_pipes_succeeds() {
@@ -582,7 +595,7 @@ mod tests {
         assert!(Arc::ptr_eq(&pipeline.synchronizer, &pipes.synchronizer));
         for name in expected_names {
             let id = pipes.names_to_ids.get(name).unwrap();
-            assert_eq!(pipes.synchronizer.get(id).await, 0);
+            assert_eq!(pipes.synchronizer.get(id), 0);
         }
     }
 
@@ -599,17 +612,17 @@ mod tests {
     #[tokio::test]
     async fn test_stage_worker_producer() {
         let value = Some("hello!".to_string());
-        let wk_value = value.clone();
+        let task_value = value.clone();
 
         let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["pipe"]);
         let (w, mut r) = pipes.create_io("pipe").unwrap();
 
-        let (written, wk_written) = atomic_mut_cloned(false);
+        let written = Arc::new(AtomicBool::new(false));
+        let task_written = written.clone();
         pipeline.register_producer("test-stage", w, || async move {
-            let mut wk_written = wk_written.lock().await;
-            if !*wk_written {
-                *wk_written = true;
-                wk_value
+            if !task_written.load(Acquire) {
+                task_written.store(true, Release);
+                task_value
             } else {
                 None
             }
@@ -617,7 +630,7 @@ mod tests {
 
         pipeline.wait().await;
 
-        assert!(*written.lock().await, "value was not handled by worker!");
+        assert!(written.load(Acquire), "value was not handled by worker!");
         assert_eq!(r.read().await, value);
     }
 
@@ -626,16 +639,17 @@ mod tests {
         let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["pipe"]);
         let (w, r) = pipes.create_io("pipe").unwrap();
 
-        let (written, wk_written) = atomic_mut_cloned(false);
+        let written = Arc::new(AtomicBool::new(false));
+        let task_written = written.clone();
         pipeline.register_consumer("test-stage", r, |n: usize| async move {
             assert_eq!(n, 3);
-            *wk_written.lock().await = true;
+            task_written.store(true, Release);
         });
 
         w.write(3).await;
         pipeline.wait().await;
 
-        assert!(*written.lock().await, "value was not handled by worker!");
+        assert!(written.load(Acquire), "value was not handled by worker!");
     }
 
     #[tokio::test]
@@ -644,19 +658,20 @@ mod tests {
         let (first_w, first_r) = pipes.create_io("first").unwrap();
         let (second_w, second_r) = pipes.create_io("second").unwrap();
 
-        let (written, wk_written) = atomic_mut_cloned(false);
+        let written = Arc::new(AtomicBool::new(false));
+        let task_written = written.clone();
         pipeline.register("test-stage", first_r, second_w, |n: usize| async move {
             Some(n + 1)
         });
         pipeline.register_consumer("test-stage", second_r, |n: usize| async move {
             assert_eq!(n, 2);
-            *wk_written.lock().await = true;
+            task_written.store(true, Release);
         });
 
         first_w.write(1).await;
         pipeline.wait().await;
 
-        assert!(*written.lock().await, "value was not handled by worker!");
+        assert!(written.load(Acquire), "value was not handled by worker!");
     }
 
     #[tokio::test]
