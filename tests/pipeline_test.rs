@@ -1,4 +1,8 @@
-use async_pipes::{atomic_mut, atomic_mut_cloned, Pipeline};
+use std::sync::atomic::Ordering::{Acquire, Release, SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::Arc;
+
+use async_pipes::Pipeline;
 
 /// Check that a simple, one-stage, linear pipeline can be created and can transfer data from a pipe's
 /// writer (start) to its reader (end).
@@ -12,15 +16,17 @@ async fn simple_linear_pipeline() {
     let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["one"]);
     let (writer, reader) = pipes.create_io("one").unwrap();
 
-    let (written, worker_written) = atomic_mut_cloned(false);
+    let written = Arc::new(AtomicBool::new(false));
+    let task_written = written.clone();
+
     pipeline.register_inputs("producer", writer, vec![5]);
     pipeline.register_consumer("consumer", reader, |value: usize| async move {
         assert_eq!(value, 5);
-        *worker_written.lock().await = true;
+        task_written.store(true, Release);
     });
     pipeline.wait().await;
 
-    assert!(*written.lock().await, "value was not handled by worker!")
+    assert!(written.load(Acquire), "value was not handled by worker!")
 }
 
 /// Check that a complex, multi-stage, linear pipeline can be created and can transfer data through the
@@ -40,7 +46,8 @@ async fn complex_linear_pipeline() {
     let (three_w, three_r) = pipes.create_io("three").unwrap();
     let (four_w, four_r) = pipes.create_io("four").unwrap();
 
-    let (written, worker_written) = atomic_mut_cloned(false);
+    let written = Arc::new(AtomicBool::new(false));
+    let task_written = written.clone();
 
     pipeline.register_inputs("producer", one_w, vec![1]);
     pipeline.register("complex0", one_r, two_w, |value: usize| async move {
@@ -57,11 +64,11 @@ async fn complex_linear_pipeline() {
     });
     pipeline.register_consumer("consumer", four_r, |value: usize| async move {
         assert_eq!(value, 7);
-        *worker_written.lock().await = true;
+        task_written.store(true, Release);
     });
     pipeline.wait().await;
 
-    assert!(*written.lock().await, "value was not handled by worker!")
+    assert!(written.load(Acquire), "value was not handled by worker!")
 }
 
 /// Test a cycle existing in the pipeline, and if the flow of content of the data is correct at each stage.
@@ -81,13 +88,16 @@ async fn cyclic_pipeline() {
     let (two_w, two_r) = pipes.create_io("two").unwrap();
     let (three_w, three_r) = pipes.create_io("three").unwrap();
 
-    let (first_passed, cyclic0_first_passed) = atomic_mut_cloned(false);
-    let (written, worker_written) = atomic_mut_cloned(false);
+    let first_passed = Arc::new(AtomicBool::new(false));
+    let task_first_passed = first_passed.clone();
+
+    let written = Arc::new(AtomicBool::new(false));
+    let task_written = written.clone();
 
     let wk_one_w = one_w.clone();
     pipeline.register_inputs("producer", one_w, vec![0]);
     pipeline.register("cyclic0", one_r, two_w, |value: usize| async move {
-        if !*cyclic0_first_passed.lock().await {
+        if !task_first_passed.load(Acquire) {
             assert_eq!(value, 0);
         } else {
             assert_eq!(value, 2);
@@ -99,9 +109,8 @@ async fn cyclic_pipeline() {
         two_r,
         vec![wk_one_w, three_w],
         |value: usize| async move {
-            let mut fp = first_passed.lock().await;
-            if !*fp {
-                *fp = true;
+            if !first_passed.load(Acquire) {
+                first_passed.store(true, Release);
                 assert_eq!(value, 1);
                 vec![Some(value + 1), None]
             } else {
@@ -112,11 +121,11 @@ async fn cyclic_pipeline() {
     );
     pipeline.register_consumer("consumer", three_r, |value: usize| async move {
         assert_eq!(value, 4);
-        *worker_written.lock().await = true;
+        task_written.store(true, Release);
     });
     pipeline.wait().await;
 
-    assert!(*written.lock().await, "value was not handled by worker!")
+    assert!(written.load(Acquire), "value was not handled by worker!")
 }
 
 /// Test a pipeline that has many branches and see if the final stage receives all the data.
@@ -162,13 +171,13 @@ async fn branching_pipeline() {
         Some(value + 1)
     });
 
-    let total = atomic_mut(0);
-    let worker_total = total.clone();
+    let total = Arc::new(AtomicUsize::new(0));
+    let task_total = total.clone();
     pipeline.register_consumer("consumer", two_r, |value: usize| async move {
-        *worker_total.lock().await += value;
+        task_total.fetch_add(value, SeqCst);
     });
 
     pipeline.wait().await;
 
-    assert_eq!(*total.lock().await, 6);
+    assert_eq!(total.load(Acquire), 6);
 }

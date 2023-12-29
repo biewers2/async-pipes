@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-
-use tokio::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::{Acquire, SeqCst};
 
 /// A generic data structure to synchronize tasks being done among multiple threads.
 ///
@@ -10,55 +10,57 @@ use tokio::sync::Mutex;
 #[derive(Default, Debug)]
 pub(crate) struct Synchronizer {
     /// Maintain a total count to easily check if all task ID counters are zero
-    total_count: Mutex<usize>,
-    counts: HashMap<String, Mutex<usize>>,
+    total_count: AtomicUsize,
+    counts: HashMap<String, AtomicUsize>,
 }
 
 impl Synchronizer {
     pub(crate) fn register<S: Into<String>>(&mut self, id: S) {
-        self.counts.insert(id.into(), Mutex::new(0));
+        self.counts.insert(id.into(), AtomicUsize::new(0));
     }
 
-    pub(crate) async fn started<S: AsRef<str>>(&self, id: S) {
-        self.started_many(id, 1).await;
+    pub(crate) fn started<S: AsRef<str>>(&self, id: S) {
+        self.started_many(id, 1);
     }
 
-    pub(crate) async fn started_many<S: AsRef<str>>(&self, id: S, n: usize) {
+    pub(crate) fn started_many<S: AsRef<str>>(&self, id: S, n: usize) {
         if let Some(count) = self.counts.get(id.as_ref()) {
-            *count.lock().await += n;
-            *self.total_count.lock().await += n;
+            count.fetch_add(n, SeqCst);
+            self.total_count.fetch_add(n, SeqCst);
         }
     }
 
-    pub(crate) async fn ended<S: AsRef<str>>(&self, id: S) {
-        self.ended_many(id, 1).await;
+    pub(crate) fn ended<S: AsRef<str>>(&self, id: S) {
+        self.ended_many(id, 1);
     }
 
-    pub(crate) async fn ended_many<S: AsRef<str>>(&self, id: S, n: usize) {
+    pub(crate) fn ended_many<S: AsRef<str>>(&self, id: S, n: usize) {
         if let Some(count) = self.counts.get(id.as_ref()) {
-            *count.lock().await -= n;
-            *self.total_count.lock().await -= n;
+            count.fetch_sub(n, SeqCst);
+            self.total_count.fetch_sub(n, SeqCst);
         }
     }
 
-    pub(crate) async fn completed(&self) -> bool {
-        *self.total_count.lock().await == 0
+    pub(crate) fn completed(&self) -> bool {
+        self.total_count.load(Acquire) == 0
     }
 
     #[cfg(test)]
-    pub async fn get<S: AsRef<str>>(&self, id: S) -> usize {
-        *self.counts[id.as_ref()].lock().await
+    pub(crate) fn get<S: AsRef<str>>(&self, id: S) -> usize {
+        self.counts[id.as_ref()].load(Acquire)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering::Acquire;
+
     use tokio::join;
 
     use crate::sync::Synchronizer;
 
-    #[tokio::test]
-    async fn test_add_creates_entry() {
+    #[test]
+    fn test_add_creates_entry() {
         let mut synch = Synchronizer::default();
         let id = "my-id";
 
@@ -66,12 +68,12 @@ mod tests {
 
         assert_eq!(synch.counts.len(), 1);
         assert!(synch.counts.contains_key(id));
-        assert_eq!(*synch.counts[id].lock().await, 0);
-        assert_eq!(*synch.total_count.lock().await, 0);
+        assert_eq!(synch.counts[id].load(Acquire), 0);
+        assert_eq!(synch.total_count.load(Acquire), 0);
     }
 
-    #[tokio::test]
-    async fn test_add_same_id_does_nothing() {
+    #[test]
+    fn test_add_same_id_does_nothing() {
         let mut synch = Synchronizer::default();
         let id = "my-id";
 
@@ -80,94 +82,94 @@ mod tests {
 
         assert_eq!(synch.counts.len(), 1);
         assert!(synch.counts.contains_key(id));
-        assert_eq!(*synch.counts[id].lock().await, 0);
-        assert_eq!(*synch.total_count.lock().await, 0);
+        assert_eq!(synch.counts[id].load(Acquire), 0);
+        assert_eq!(synch.total_count.load(Acquire), 0);
     }
 
-    #[tokio::test]
-    async fn test_started_many_works() {
+    #[test]
+    fn test_started_many_works() {
         let mut synch = Synchronizer::default();
         let ids = ["id0", "id1", "id2"];
         ids.iter().for_each(|id| synch.register(*id));
 
-        synch.started_many("id0", 3).await;
-        synch.started_many("id1", 1).await;
-        synch.started_many("id2", 7).await;
+        synch.started_many("id0", 3);
+        synch.started_many("id1", 1);
+        synch.started_many("id2", 7);
 
-        assert_eq!(*synch.counts["id0"].lock().await, 3);
-        assert_eq!(*synch.counts["id1"].lock().await, 1);
-        assert_eq!(*synch.counts["id2"].lock().await, 7);
-        assert_eq!(*synch.total_count.lock().await, 11);
+        assert_eq!(synch.counts["id0"].load(Acquire), 3);
+        assert_eq!(synch.counts["id1"].load(Acquire), 1);
+        assert_eq!(synch.counts["id2"].load(Acquire), 7);
+        assert_eq!(synch.total_count.load(Acquire), 11);
     }
 
-    #[tokio::test]
-    async fn test_started_works() {
+    #[test]
+    fn test_started_works() {
         let mut synch = Synchronizer::default();
         let ids = ["id0", "id1", "id2"];
         ids.iter().for_each(|id| synch.register(*id));
 
-        synch.started("id0").await;
-        synch.started("id1").await;
-        synch.started("id2").await;
+        synch.started("id0");
+        synch.started("id1");
+        synch.started("id2");
 
-        assert_eq!(*synch.counts["id0"].lock().await, 1);
-        assert_eq!(*synch.counts["id1"].lock().await, 1);
-        assert_eq!(*synch.counts["id2"].lock().await, 1);
-        assert_eq!(*synch.total_count.lock().await, 3);
+        assert_eq!(synch.counts["id0"].load(Acquire), 1);
+        assert_eq!(synch.counts["id1"].load(Acquire), 1);
+        assert_eq!(synch.counts["id2"].load(Acquire), 1);
+        assert_eq!(synch.total_count.load(Acquire), 3);
     }
 
-    #[tokio::test]
-    async fn test_ended_many_works() {
+    #[test]
+    fn test_ended_many_works() {
         let mut synch = Synchronizer::default();
         let ids = ["id0", "id1", "id2"];
         ids.iter().for_each(|id| synch.register(*id));
 
-        synch.started_many("id0", 10).await;
-        synch.started_many("id1", 10).await;
-        synch.started_many("id2", 10).await;
+        synch.started_many("id0", 10);
+        synch.started_many("id1", 10);
+        synch.started_many("id2", 10);
 
-        synch.ended_many("id0", 3).await;
-        synch.ended_many("id1", 1).await;
-        synch.ended_many("id2", 7).await;
+        synch.ended_many("id0", 3);
+        synch.ended_many("id1", 1);
+        synch.ended_many("id2", 7);
 
-        assert_eq!(*synch.counts["id0"].lock().await, 7);
-        assert_eq!(*synch.counts["id1"].lock().await, 9);
-        assert_eq!(*synch.counts["id2"].lock().await, 3);
-        assert_eq!(*synch.total_count.lock().await, 19);
+        assert_eq!(synch.counts["id0"].load(Acquire), 7);
+        assert_eq!(synch.counts["id1"].load(Acquire), 9);
+        assert_eq!(synch.counts["id2"].load(Acquire), 3);
+        assert_eq!(synch.total_count.load(Acquire), 19);
     }
 
-    #[tokio::test]
-    async fn test_ended_works() {
+    #[test]
+    fn test_ended_works() {
         let mut synch = Synchronizer::default();
         let ids = ["id0", "id1", "id2"];
         ids.iter().for_each(|id| synch.register(*id));
 
-        synch.started_many("id0", 10).await;
-        synch.started_many("id1", 10).await;
-        synch.started_many("id2", 10).await;
+        synch.started_many("id0", 10);
+        synch.started_many("id1", 10);
+        synch.started_many("id2", 10);
 
-        synch.ended("id0").await;
-        synch.ended("id1").await;
-        synch.ended("id2").await;
+        synch.ended("id0");
+        synch.ended("id1");
+        synch.ended("id2");
 
-        assert_eq!(*synch.counts["id0"].lock().await, 9);
-        assert_eq!(*synch.counts["id1"].lock().await, 9);
-        assert_eq!(*synch.counts["id2"].lock().await, 9);
-        assert_eq!(*synch.total_count.lock().await, 27);
+        assert_eq!(synch.counts["id0"].load(Acquire), 9);
+        assert_eq!(synch.counts["id1"].load(Acquire), 9);
+        assert_eq!(synch.counts["id2"].load(Acquire), 9);
+        assert_eq!(synch.total_count.load(Acquire), 27);
     }
 
-    #[tokio::test]
-    async fn test_completed_works() {
+    #[test]
+    fn test_completed_works() {
         let mut synch = Synchronizer::default();
         let ids = ["id0", "id1", "id2"];
         ids.iter().for_each(|id| synch.register(*id));
 
-        assert!(synch.completed().await);
+        assert!(synch.completed());
 
         for id in ids {
-            synch.started(id).await;
-            assert!(!synch.completed().await);
-            synch.ended(id).await;
+            synch.started(id);
+            assert!(!synch.completed());
+            synch.ended(id);
         }
     }
 
@@ -180,28 +182,28 @@ mod tests {
         join!(
             async {
                 for _ in [0; 100] {
-                    synch.started("id0").await;
+                    synch.started("id0");
                 }
                 for _ in [0; 100] {
-                    synch.started("id1").await;
+                    synch.started("id1");
                 }
                 for _ in [0; 100] {
-                    synch.started("id2").await;
+                    synch.started("id2");
                 }
             },
             async {
                 for _ in [0; 100] {
-                    synch.ended("id0").await;
+                    synch.ended("id0");
                 }
                 for _ in [0; 100] {
-                    synch.ended("id1").await;
+                    synch.ended("id1");
                 }
                 for _ in [0; 100] {
-                    synch.ended("id2").await;
+                    synch.ended("id2");
                 }
             },
         );
 
-        assert!(synch.completed().await);
+        assert!(synch.completed());
     }
 }
