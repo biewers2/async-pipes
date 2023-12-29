@@ -5,6 +5,7 @@ authors = ["Jake Biewer <biewers2@gmail.com>"]
 edition = "2021"
 rust-version = "1.63.0" # According to `$ cargo msrv`
 description = "A library for building concurrent data processing pipelines"
+license = "GPL-2.0-or-later"
 readme = "./README.md"
 homepage = "https://github.com/biewers2/async-pipes"
 repository = "https://github.com/biewers2/async-pipes"
