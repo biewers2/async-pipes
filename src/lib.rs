@@ -29,70 +29,7 @@
 //!
 //! # Getting Started
 //!
-//! One of the core concepts of a pipeline is its pipes, which is the first thing defined when
-//! constructing a pipeline. Pipes are defined by providing a list of their names. These names
-//! are used later to get the I/O objects of a pipe, and those will be used to read from/write to the
-//! pipe.
-//! ```
-//! use async_pipes::Pipeline;
-//!
-//! let pipe_names = vec!["Transfer", "Counted"];
-//! let (mut pipeline, mut pipes) = Pipeline::from_pipes(pipe_names);
-//! ```
-//!
-//! The `pipes` value is an instance of [Pipes], and using this the I/O objects can be created
-//! for a pipe by calling [Pipes::create_io] and specifying the pipe's name. In the example below,
-//! The I/O objects would be [`PipeReader<String>`] and [`PipeWriter<String>`].
-//!
-//! Pipe writers can be cloned as many times as needed, but there can only be a single pipe reader for a pipe.
-//! ```
-//! use async_pipes::Pipeline;
-//!
-//! let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["Transfer", "Counted"]);
-//!
-//! let (transfer_writer, transfer_reader) = pipes.create_io::<String>("Transfer").unwrap();
-//! let (counter_writer, counter_reader) = pipes.create_io::<usize>("Counted").unwrap();
-//! ```
-//!
-//! With the I/O objects of a pipe, stages can be registered to operate on data flowing through the pipes.
-//!
-//! There are a few categories of stages, each distinguished to allow for different semantics. For example,
-//! some of the categories are static/dynamic producers, regular stages, branching stages, consumers, etc.
-//! For more info on these categories, see [Stage Categories](#stage-categories).
-//!
-//! Once a stage is registered, the worker will make progress if it can. This means (in a multi-threaded
-//! context) if there is an available thread to run on, the worker will make progress on that thread.
-//!
-//! After registering the stages, call [Pipeline::wait] to wait for the pipeline to finish.
-//! ```
-//! use async_pipes::Pipeline;
-//!
-//! #[tokio::main]
-//! async fn main() {
-//!     use std::sync::Arc;
-//! use std::sync::atomic::{AtomicUsize, Ordering};
-//! let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["Transfer", "Counted"]);
-//!
-//!     let (transfer_writer, transfer_reader) = pipes.create_io::<String>("Transfer").unwrap();
-//!     let (counted_writer, counted_reader) = pipes.create_io::<usize>("Counted").unwrap();
-//!
-//!     let sum = Arc::new(AtomicUsize::new(0));
-//!     let summer_sum = sum.clone();
-//!
-//!     let inputs = vec!["a".to_string(), "abc".to_string()];
-//!     pipeline.register_inputs("Transfer", transfer_writer, inputs);
-//!     pipeline.register("Counter", transfer_reader, counted_writer, |value: String| async move {
-//!         Some(value.len())
-//!     });
-//!     pipeline.register_consumer("Summer", counted_reader, |value: usize| async move {
-//!         summer_sum.fetch_add(value, Ordering::SeqCst);
-//!     });
-//!
-//!     pipeline.wait().await;
-//!
-//!     assert_eq!(sum.load(Ordering::Acquire), 4);
-//! }
-//! ```
+//! todo
 //!
 //! # Stage Categories <a name="stage-categories"></a>
 //!
@@ -102,76 +39,79 @@
 //! **Static (definite)**
 //!
 //! This is where a list of concrete values can be provided to the stage and the worker will loop over each
-//! value and feed it into a [PipeWriter].
-//! * [Pipeline::register_inputs]
-//! * [Pipeline::register_branching_inputs]
+//! value and feed it into a pipe.
+//! * [PipelineBuilder::with_inputs]
+//! * [PipelineBuilder::with_branching_inputs]
 //!
 //! **Dynamic (indefinite)**
 //!
 //! This is useful when there are no pre-defined input values. Instead, a function that produces a single
 //! value can be provided that produces an [Option] where it's continually called until [None] is returned.
 //! This can be useful when receiving data over the network, or data is read from a file.
-//! * [Pipeline::register_producer]
-//! * [Pipeline::register_branching_producer]
+//! * [PipelineBuilder::with_producer]
+//! * [PipelineBuilder::with_branching_producer]
 //!
 //! ### Consumer ("terminating stage")
-//! A consumer is a final stage in the pipeline where data ends up. It takes in a single pipe reader and
+//! A consumer is a final stage in the pipeline where data ends up. It takes in a single pipe to read from and
 //! produces no output.
-//! * [Pipeline::register_consumer]
+//! * [PipelineBuilder::with_consumer]
 //!
 //! ### Regular (1 input, 1 output)
 //! This is an intermediate stage in the pipeline that takes in a single input, and produces one or more output.
-//! * [Pipeline::register]
-//! * [Pipeline::register_branching]
+//! * [PipelineBuilder::with_stage]
+//! * [PipelineBuilder::with_branching_stage]
 //!
 //! # Stage Variants
 //!
 //! ### Branching (1 input, N outputs)
 //! A branching stage is a stage where multiple output pipes are connected. This means the task defined by the
 //! user in this stage returns two or more output values.
-//! * [Pipeline::register_branching]
-//! * [Pipeline::register_branching_inputs]
-//! * [Pipeline::register_branching_producer]
+//! * [PipelineBuilder::with_branching_inputs]
+//! * [PipelineBuilder::with_branching_producer]
+//! * [PipelineBuilder::with_branching_stage]
 //!
 //! # Examples
 //!
 //! ```
 //! use async_pipes::Pipeline;
-//!
-//! #[tokio::main]
-//! async fn main() {
-//!     // Create the pipeline from a list of pipe names.
 //! use std::sync::Arc;
 //! use std::sync::atomic::{AtomicUsize, Ordering};
 //! use tokio::sync::Mutex;
 //!
-//! let (mut pipeline, mut pipes) =
-//!         Pipeline::from_pipes(vec!["MapInput", "MapToReduce"]);
-//!
-//!     // We create "writers" (*_w) and "readers" (*_r) to transfer data
-//!     let (map_input_w, map_input_r) = pipes.create_io("MapInput").unwrap();
-//!     let (map_to_reduce_w, map_to_reduce_r) = pipes.create_io("MapToReduce").unwrap();
-//!
-//!     // After creating the pipes, stage workers are registered in the pipeline.
-//!     pipeline.register_inputs("Producer", map_input_w, vec!["a", "bb", "ccc"]);
-//!
-//!     // We return an option to tell the stage whether to write `new_value` to the pipe or ignore it.
-//!     pipeline.register("MapStage", map_input_r, map_to_reduce_w, |value: &'static str| async move {
-//!         let new_value = format!("{}!", value);
-//!         Some(new_value)
-//!     });
-//!
-//!     // It's recommended to wrap large read-only data in an [Arc], as the closure is cloned
-//!     // on each execution (which means context values are too). It's required to do this if the
-//!     // value is mutable so the variable points to the same data.
+//! #[tokio::main]
+//! async fn main() {
+//!     // Due to the task function returning a future (`async move { ... }`), data needs
+//!     // to be wrapped in an [Arc] and then cloned in order to be moved into the task
+//!     // while still referencing it from this scope
 //!     let total_count = Arc::new(AtomicUsize::new(0));
-//!     let reduce_total_count = total_count.clone();
+//!     let task_total_count = total_count.clone();
 //!
-//!     pipeline.register_consumer("ReduceStage", map_to_reduce_r, |value: String| async move {
-//!         reduce_total_count.fetch_add(value.len(), Ordering::SeqCst);
-//!     });
+//!     Pipeline::builder()
+//!         .with_inputs("MapPipe", vec!["a", "bb", "ccc"])
 //!
-//!     pipeline.wait().await;
+//!         // Read from the 'MapPipe' and write to the 'ReducePipe'
+//!         .with_stage("MapPipe", "ReducePipe", |value: &'static str| async move {
+//!             // We return an option to tell the stage whether to write the new value
+//!             // to the pipe or ignore it
+//!             Some(format!("{}!", value))
+//!         })
+//!
+//!         // Read from the 'ReducePipe'.
+//!         .with_consumer("ReducePipe", move |value: String| {
+//!             // The captured `task_total_count` can't move out of this closure, so we
+//!             // have to clone it to give ownership to the async block. Remember, it's
+//!             // wrapped in an [Arc] so we're still referring to the original data.
+//!             let total_count = task_total_count.clone();
+//!             async move {
+//!                 total_count.fetch_add(value.len(), Ordering::SeqCst);
+//!             }
+//!         })
+//!
+//!         // Build the pipeline and wait for it to finish
+//!         .build()
+//!         .expect("failed to build pipeline!")
+//!         .wait()
+//!         .await;
 //!
 //!     // We see that after the data goes through our map and reduce stages,
 //!     // we effectively get this: `len("a!") + len("bb!") + len("ccc!") = 9`
@@ -182,17 +122,16 @@
 #![warn(missing_docs)]
 
 use std::fmt::{Debug, Display, Formatter};
-use std::future::Future;
 
-use tokio::sync::mpsc::Receiver;
-
-pub use io::*;
 pub use pipeline::*;
 
 mod io;
 mod pipeline;
-pub(crate) mod sync;
-mod util;
+mod sync;
+
+fn new_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
 
 /// Signals sent to stage workers.
 ///
@@ -222,19 +161,4 @@ impl Display for StageWorkerSignal {
             }
         )
     }
-}
-
-/// Simple data structure to hold information about a stage worker.
-#[derive(Debug)]
-struct StageWorker<
-    I: Send + 'static,
-    O: Send + 'static,
-    F: FnOnce(I) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Vec<Option<O>>> + Send + 'static,
-> {
-    name: String,
-    signal_rx: Receiver<StageWorkerSignal>,
-    reader: PipeReader<I>,
-    writers: Vec<PipeWriter<O>>,
-    task_definition: F,
 }
