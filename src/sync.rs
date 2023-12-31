@@ -8,45 +8,45 @@ use std::sync::atomic::Ordering::{Acquire, SeqCst};
 /// "ended" which increments and decrements (respectively) the respective task ID counter. A synchronizer
 /// is considered "complete" if all task ID counters are zero.
 #[derive(Default, Debug)]
-pub(crate) struct Synchronizer {
+pub struct Synchronizer {
     /// Maintain a total count to easily check if all task ID counters are zero
     total_count: AtomicUsize,
     counts: HashMap<String, AtomicUsize>,
 }
 
 impl Synchronizer {
-    pub(crate) fn register<S: Into<String>>(&mut self, id: S) {
+    pub fn register<S: Into<String>>(&mut self, id: S) {
         self.counts.insert(id.into(), AtomicUsize::new(0));
     }
 
-    pub(crate) fn started<S: AsRef<str>>(&self, id: S) {
+    pub fn started<S: AsRef<str>>(&self, id: S) {
         self.started_many(id, 1);
     }
 
-    pub(crate) fn started_many<S: AsRef<str>>(&self, id: S, n: usize) {
+    pub fn started_many<S: AsRef<str>>(&self, id: S, n: usize) {
         if let Some(count) = self.counts.get(id.as_ref()) {
             count.fetch_add(n, SeqCst);
             self.total_count.fetch_add(n, SeqCst);
         }
     }
 
-    pub(crate) fn ended<S: AsRef<str>>(&self, id: S) {
+    pub fn ended<S: AsRef<str>>(&self, id: S) {
         self.ended_many(id, 1);
     }
 
-    pub(crate) fn ended_many<S: AsRef<str>>(&self, id: S, n: usize) {
+    pub fn ended_many<S: AsRef<str>>(&self, id: S, n: usize) {
         if let Some(count) = self.counts.get(id.as_ref()) {
             count.fetch_sub(n, SeqCst);
             self.total_count.fetch_sub(n, SeqCst);
         }
     }
 
-    pub(crate) fn completed(&self) -> bool {
+    pub fn completed(&self) -> bool {
         self.total_count.load(Acquire) == 0
     }
 
     #[cfg(test)]
-    pub(crate) fn get<S: AsRef<str>>(&self, id: S) -> usize {
+    pub fn get<S: AsRef<str>>(&self, id: S) -> usize {
         self.counts[id.as_ref()].load(Acquire)
     }
 }
