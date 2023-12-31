@@ -86,20 +86,6 @@ struct TaskPipeNames {
     writers: Vec<String>,
 }
 
-struct UtilityStage {
-    util_type: UtilityType,
-    pipes: UtilityPipeNames,
-}
-
-struct UtilityPipeNames {
-    reader: String,
-    writer: String,
-}
-
-enum UtilityType {
-    Flatten,
-}
-
 struct Pipe<T> {
     writer: PipeWriter<T>,
     /// Use an option here to "take" it when a reader is used.
@@ -116,7 +102,6 @@ struct Pipe<T> {
 pub struct PipelineBuilder {
     producer_fns: Vec<ProducerStage>,
     task_fns: Vec<TaskStage>,
-    util_fns: Vec<UtilityStage>,
 }
 
 impl PipelineBuilder {
@@ -361,63 +346,6 @@ impl PipelineBuilder {
         self
     }
 
-    /// Register a new stage in the pipeline that "flattens" data between pipes.
-    ///
-    /// This stage defines a worker that reads in a list of values from `from` and writes each value
-    /// to `to`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::sync::Arc;
-    /// use async_pipes::Pipeline;
-    ///
-    /// #[tokio::main]
-    /// async fn main() {
-    /// use std::sync::atomic::{AtomicUsize, Ordering};
-    /// let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["ListOfLists", "ListOfValues"]);
-    /// let (lol_w, lol_r) = pipes.create_io("ListOfLists").unwrap();
-    /// let (lov_w, lov_r) = pipes.create_io("ListOfValues").unwrap();
-    ///
-    /// pipeline.register_inputs("Producer", lol_w, vec![
-    ///     vec![1, 1, 1],
-    ///     vec![1, 1, 1],
-    ///     vec![1, 1, 1],
-    /// ]);
-    ///
-    /// // Flatten the list of lists into a single list and then find the sum.
-    /// pipeline.flatten(lol_r, lov_w);
-    ///
-    /// let sum = Arc::new(AtomicUsize::new(0));
-    /// let task_sum = sum.clone();
-    /// pipeline.register_consumer("Consumer", lov_r, |n: usize| async move {
-    ///     task_sum.fetch_add(n, Ordering::SeqCst);
-    /// });
-    ///
-    /// pipeline.wait().await;
-    ///
-    /// assert_eq!(sum.load(Ordering::Acquire), 9);
-    /// }
-    pub fn while_flattening<S: AsRef<str>>(mut self, from_pipe: S, to_pipe: S) -> Self {
-        // self.workers.spawn(async move {
-        //     while let Some(values) = from.read().await {
-        //         for value in values {
-        //             to.write(value).await;
-        //         }
-        //         from.consumed_callback()();
-        //     }
-        // });
-
-        self.util_fns.push(UtilityStage {
-            util_type: UtilityType::Flatten,
-            pipes: UtilityPipeNames {
-                reader: from_pipe.as_ref().to_string(),
-                writer: to_pipe.as_ref().to_string(),
-            },
-        });
-        self
-    }
-
     /// When the pipeline is ready to be built, this is called and will return a pipeline if
     /// it was successfully built, otherwise it will return an error describing why it could not be built.
     ///
@@ -461,24 +389,6 @@ impl PipelineBuilder {
                 writers,
                 signal_rx,
             ));
-        }
-
-        // Spawn utility workers
-        for utility in self.util_fns {
-            let writer_name = &utility.pipes.writer;
-            let writer = Self::find_writer(writer_name, &pipes)?;
-
-            let reader_name = &utility.pipes.reader;
-            let reader = Self::find_reader(reader_name, &mut pipes)?;
-
-            let (signal_tx, signal_rx) = channel(1);
-            signal_txs.push(signal_tx);
-
-            match utility.util_type {
-                UtilityType::Flatten => {
-                    workers.spawn(Self::new_detached_flattener(reader, writer, signal_rx));
-                }
-            }
         }
 
         Ok(Pipeline {
@@ -527,9 +437,6 @@ impl PipelineBuilder {
     fn names(&self) -> Vec<&String> {
         let mut names = HashSet::new();
         for f in &self.task_fns {
-            names.insert(&f.pipes.reader);
-        }
-        for f in &self.util_fns {
             names.insert(&f.pipes.reader);
         }
         names.into_iter().collect()
@@ -596,49 +503,6 @@ impl PipelineBuilder {
                 Some(value) = reader.read() => {
                     let consumed = reader.consumed_callback();
                     let writers = writers.clone();
-                    let result = task(value);
-
-                    tasks.spawn(async move {
-                        if let Some(results) = result.await {
-                            write_results(writers, results).await;
-                        }
-
-                        // Mark input as consumed *after* writing outputs
-                        // (avoids false positive of completed pipeline)
-                        consumed();
-                    });
-                }
-
-                // Join tasks to check for errors
-                Some(result) = tasks.join_next(), if !tasks.is_empty() => {
-                    check_join_result(&result);
-                }
-
-                // Receive external signals
-                Some(signal) = signal_rx.recv() => {
-                    match signal {
-                        StageWorkerSignal::Terminate => break,
-                        StageWorkerSignal::Ping => println!("Pong!"),
-                    }
-                },
-            }
-        }
-
-        tasks.shutdown().await;
-    }
-
-    async fn new_detached_flattener(
-        mut reader: PipeReader<BoxedAnySend>,
-        writer: PipeWriter<BoxedAnySend>,
-        mut signal_rx: Receiver<StageWorkerSignal>,
-    ) {
-        let mut tasks = JoinSet::new();
-
-        loop {
-            select! {
-                Some(value) = reader.read() => {
-                    let consumed = reader.consumed_callback();
-                    let writer = writer.clone();
                     let result = task(value);
 
                     tasks.spawn(async move {
@@ -866,172 +730,97 @@ fn check_join_result<T>(result: &Result<T, JoinError>) {
 
 #[cfg(test)]
 mod tests {
-    // use std::ops::Deref;
-    // use std::sync::atomic::AtomicBool;
-    // use std::sync::atomic::Ordering::{Acquire, Release};
-    // use std::sync::Arc;
-    // use std::time::Duration;
-    //
-    // use tokio::join;
-    // use tokio::sync::Mutex;
-    //
-    // use crate::{Pipeline, StageWorkerSignal};
-    //
-    // #[test]
-    // fn test_pipeline_from_no_pipes_succeeds() {
-    //     let (_, pipes) = Pipeline::from_pipes(Vec::<String>::new());
-    //
-    //     assert_eq!(pipes.ids.len(), 0);
-    // }
-    //
-    // #[tokio::test]
-    // async fn test_pipeline_from_pipes_succeeds() {
-    //     let mut expected_names = vec!["start", "middle", "end"];
-    //     expected_names.sort();
-    //
-    //     let (pipeline, pipes) = Pipeline::from_pipes(expected_names.clone());
-    //     let mut actual_names = pipes.ids.keys().map(|s| s.deref()).collect::<Vec<&str>>();
-    //     actual_names.sort();
-    //
-    //     assert_eq!(pipes.ids.len(), 3);
-    //     assert_eq!(actual_names, expected_names);
-    //
-    //     assert!(Arc::ptr_eq(&pipeline.synchronizer, &pipes.synchronizer));
-    //     for name in expected_names {
-    //         let id = pipes.ids.get(name).unwrap();
-    //         assert_eq!(pipes.synchronizer.get(id), 0);
-    //     }
-    // }
-    //
-    // #[test]
-    // fn test_pipes_create_io_returns_correctly() {
-    //     let names = vec!["start", "middle", "end"];
-    //
-    //     let (_, mut pipes) = Pipeline::from_pipes(names);
-    //
-    //     assert!(pipes.create_io::<()>("undefined").is_none());
-    //     assert!(pipes.create_io::<()>("start").is_some());
-    // }
-    //
-    // #[tokio::test]
-    // async fn test_stage_producer() {
-    //     let value = Some("hello!".to_string());
-    //     let task_value = value.clone();
-    //
-    //     let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["pipe"]);
-    //     let (w, mut r) = pipes.create_io("pipe").unwrap();
-    //
-    //     let written = Arc::new(AtomicBool::new(false));
-    //     let task_written = written.clone();
-    //     pipeline.register_producer("test-stage", w, || async move {
-    //         if !task_written.load(Acquire) {
-    //             task_written.store(true, Release);
-    //             task_value
-    //         } else {
-    //             None
-    //         }
-    //     });
-    //
-    //     pipeline.wait().await;
-    //
-    //     assert!(written.load(Acquire), "value was not handled by worker!");
-    //     assert_eq!(r.read().await, value);
-    // }
-    //
-    // #[tokio::test]
-    // async fn test_stage_consumer() {
-    //     let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["pipe"]);
-    //     let (w, r) = pipes.create_io("pipe").unwrap();
-    //
-    //     let written = Arc::new(AtomicBool::new(false));
-    //     let task_written = written.clone();
-    //     pipeline.register_consumer("test-stage", r, |n: usize| async move {
-    //         assert_eq!(n, 3);
-    //         task_written.store(true, Release);
-    //     });
-    //
-    //     w.write(3).await;
-    //     pipeline.wait().await;
-    //
-    //     assert!(written.load(Acquire), "value was not handled by worker!");
-    // }
-    //
-    // #[tokio::test]
-    // async fn test_stage_single_output() {
-    //     let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["first", "second"]);
-    //     let (first_w, first_r) = pipes.create_io("first").unwrap();
-    //     let (second_w, second_r) = pipes.create_io("second").unwrap();
-    //
-    //     let written = Arc::new(AtomicBool::new(false));
-    //     let task_written = written.clone();
-    //     pipeline.register("test-stage", first_r, second_w, |n: usize| async move {
-    //         Some(n + 1)
-    //     });
-    //     pipeline.register_consumer("test-stage", second_r, |n: usize| async move {
-    //         assert_eq!(n, 2);
-    //         task_written.store(true, Release);
-    //     });
-    //
-    //     first_w.write(1).await;
-    //     pipeline.wait().await;
-    //
-    //     assert!(written.load(Acquire), "value was not handled by worker!");
-    // }
-    //
-    // #[tokio::test]
-    // async fn test_stage_flatten() {
-    //     let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["ListOfLists", "ListOfValues"]);
-    //     let (lol_w, lol_r) = pipes.create_io("ListOfLists").unwrap();
-    //     let (lov_w, lov_r) = pipes.create_io("ListOfValues").unwrap();
-    //
-    //     let word = Arc::new(Mutex::new(String::new()));
-    //     let task_word = word.clone();
-    //     pipeline.register_inputs(
-    //         "Producer",
-    //         lol_w,
-    //         vec![
-    //             vec!["Th", "i", "s "],
-    //             vec!["is "],
-    //             vec!["a ", "phr", "ase", "."],
-    //         ],
-    //     );
-    //     pipeline.flatten(lol_r, lov_w);
-    //     pipeline.register_consumer("Consumer", lov_r, |s: &'static str| async move {
-    //         let mut w = task_word.lock().await;
-    //         *w = format!("{}{}", w, s);
-    //     });
-    //
-    //     pipeline.wait().await;
-    //
-    //     assert_eq!(*word.lock().await, "This is a phrase.".to_string());
-    // }
-    //
-    // #[tokio::test]
-    // #[should_panic]
-    // async fn test_stage_propagates_task_panic() {
-    //     let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["pipe"]);
-    //     let (w, r) = pipes.create_io("pipe").unwrap();
-    //
-    //     pipeline.register_consumer("test-stage", r, |_: ()| async move { panic!("AHH!") });
-    //     w.write(()).await;
-    //     pipeline.wait().await;
-    // }
-    //
-    // #[tokio::test]
-    // async fn test_stage_receives_signal_terminate() {
-    //     let (mut pipeline, mut pipes) = Pipeline::from_pipes(vec!["pipe"]);
-    //     let (w, r) = pipes.create_io("pipe").unwrap();
-    //
-    //     pipeline.register_consumer("test-stage", r, |_: ()| async move {
-    //         tokio::time::sleep(Duration::from_secs(1)).await;
-    //         panic!("worker did not terminate!");
-    //     });
-    //     w.write(()).await;
-    //
-    //     let signaller = pipeline.signal_txs.iter().next().unwrap().clone();
-    //     let _ = join!(
-    //         pipeline.wait(),
-    //         signaller.send(StageWorkerSignal::Terminate),
-    //     );
-    // }
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::join;
+
+    use crate::{Pipeline, StageWorkerSignal};
+
+    #[tokio::test]
+    async fn test_stage_producer() {
+        let written = Arc::new(AtomicBool::new(false));
+        let task_written = written.clone();
+
+        Pipeline::builder()
+            .with_producer("pipe", move || {
+                let written = task_written.clone();
+                async move {
+                    if !written.load(Acquire) {
+                        written.store(true, Release);
+                        Some("hello!".to_string())
+                    } else {
+                        None
+                    }
+                }
+            })
+            .with_consumer("pipe", |value: String| async move {
+                assert_eq!(value, "hello!".to_string());
+            })
+            .build()
+            .unwrap()
+            .wait()
+            .await;
+
+        assert!(written.load(Acquire), "value was not handled by worker!");
+    }
+
+    #[tokio::test]
+    async fn test_stage_single_output() {
+        let written = Arc::new(AtomicBool::new(false));
+        let task_written = written.clone();
+
+        Pipeline::builder()
+            .with_inputs("first", vec![1usize])
+            .with_stage(
+                "first",
+                "second",
+                |value: usize| async move { Some(value + 1) },
+            )
+            .with_consumer("second", move |value: usize| {
+                let written = task_written.clone();
+                async move {
+                    assert_eq!(value, 2);
+                    written.store(true, Release);
+                }
+            })
+            .build()
+            .unwrap()
+            .wait()
+            .await;
+
+        assert!(written.load(Acquire), "value was not handled by worker!");
+    }
+
+    #[tokio::test]
+    #[should_panic]
+    async fn test_stage_propagates_task_panic() {
+        Pipeline::builder()
+            .with_inputs("pipe", vec![()])
+            .with_consumer("pipe", |_: ()| async move { panic!("AHH!") })
+            .build()
+            .unwrap()
+            .wait()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_stage_receives_signal_terminate() {
+        let pipeline = Pipeline::builder()
+            .with_inputs("pipe", vec![()])
+            .with_consumer("pipe", |_: ()| async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                panic!("worker did not terminate!");
+            })
+            .build()
+            .unwrap();
+
+        let signaller = pipeline.signal_txs.first().unwrap().clone();
+        let _ = join!(
+            pipeline.wait(),
+            signaller.send(StageWorkerSignal::Terminate),
+        );
+    }
 }
