@@ -1,6 +1,6 @@
 [package]
 name = "async-pipes"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Jake Biewer <biewers2@gmail.com>"]
 edition = "2021"
 rust-version = "1.63.0" # According to `$ cargo msrv`
