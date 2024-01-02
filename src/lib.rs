@@ -2,13 +2,10 @@
 //!
 //! # Overview
 //!
-//! Async Pipes provides a simple way to create high-throughput data processing pipelines by utilizing Rust's
-//! asynchronous runtime capabilities. This is done by this library providing the infrastructure for managing
-//! asynchronous tasks and data transfer between the tasks so the developer only has to worry about the task-specific
-//! implementation for each stage in the pipeline.
-//!
-//! A core feature of this library is that it designed to run in any runtime environment (single-threaded or
-//! multi-threaded).
+//! Async Pipes provides a simple way to create high-throughput data processing pipelines by
+//! utilizing Rust's asynchronous runtime capabilities. This is done by managing task execution and
+//! data flow so the developer only has to worry about the task-specific implementation for each
+//! stage in the pipeline.
 //!
 //! # Terminology
 //!
@@ -29,7 +26,17 @@
 //!
 //! # Getting Started
 //!
-//! todo
+//! A pipeline can be built using the builder provided by [Pipeline::builder]. This allows the
+//! pipeline to be configured before any work is done.
+//!
+//! With the builder, any number of stages can be defined with any number of pipes, but there are a
+//! few requirements:
+//! 1. There must be at least one producer - how else will data get into the pipeline?
+//! 2. Every pipe must have a corresponding stage that reads data from it - this is required to
+//!    avoid a deadlock from pipes being filled up but not emptied.
+//!
+//! This requirements are enforced by [PipelineBuilder::build] returning a
+//! [Result<Pipeline, String>] where an error describing the missing requirement is returned.
 //!
 //! # Stage Categories <a name="stage-categories"></a>
 //!
@@ -38,38 +45,41 @@
 //!
 //! **Static (definite)**
 //!
-//! This is where a list of concrete values can be provided to the stage and the worker will loop over each
-//! value and feed it into a pipe.
+//! This is where a list of concrete values can be provided to the stage and the worker will loop
+//! over each value and feed it into a pipe.
 //! * [PipelineBuilder::with_inputs]
 //! * [PipelineBuilder::with_branching_inputs]
 //!
 //! **Dynamic (indefinite)**
 //!
-//! This is useful when there are no pre-defined input values. Instead, a function that produces a single
-//! value can be provided that produces an [Option] where it's continually called until [None] is returned.
-//! This can be useful when receiving data over the network, or data is read from a file.
+//! This is useful when there are no pre-defined input values. Instead, a function that produces a
+//! single value can be provided that produces an [Option] where it's continually called until
+//! [None] is returned. This can be useful when receiving data over the network, or data is read
+//! from a file.
 //! * [PipelineBuilder::with_producer]
 //! * [PipelineBuilder::with_branching_producer]
 //!
 //! ### Consumer ("terminating stage")
-//! A consumer is a final stage in the pipeline where data ends up. It takes in a single pipe to read from and
-//! produces no output.
+//! A consumer is a final stage in the pipeline where data ends up. It takes in a single pipe to
+//! read from and produces no output.
 //! * [PipelineBuilder::with_consumer]
 //!
 //! ### Regular (1 input, 1 output)
-//! This is an intermediate stage in the pipeline that takes in a single input, and produces one or more output.
+//! This is an intermediate stage in the pipeline that takes in a single input, and produces one or
+//! more output.
 //! * [PipelineBuilder::with_stage]
 //! * [PipelineBuilder::with_branching_stage]
 //!
 //! ### Utility
-//! This is an intermediate stage in the pipeline that can be used to do common operations on data between pipes.
+//! This is an intermediate stage in the pipeline that can be used to do common operations on data
+//! between pipes.
 //! * [PipelineBuilder::with_flattener]
 //!
 //! # Stage Variants
 //!
 //! ### Branching (1 input, N outputs)
-//! A branching stage is a stage where multiple output pipes are connected. This means the task defined by the
-//! user in this stage returns two or more output values.
+//! A branching stage is a stage where multiple output pipes are connected. This means the task
+//! defined by the user in this stage returns two or more output values.
 //! * [PipelineBuilder::with_branching_inputs]
 //! * [PipelineBuilder::with_branching_producer]
 //! * [PipelineBuilder::with_branching_stage]
@@ -83,7 +93,7 @@
 //! use tokio::sync::Mutex;
 //!
 //! #[tokio::main]
-//! async fn main() {
+//! async fn main() -> Result<(), String> {
 //!     // Due to the task function returning a future (`async move { ... }`), data needs
 //!     // to be wrapped in an [Arc] and then cloned in order to be moved into the task
 //!     // while still referencing it from this scope
@@ -112,14 +122,14 @@
 //!         })
 //!
 //!         // Build the pipeline and wait for it to finish
-//!         .build()
-//!         .expect("failed to build pipeline!")
+//!         .build()?
 //!         .wait()
 //!         .await;
 //!
 //!     // We see that after the data goes through our map and reduce stages,
 //!     // we effectively get this: `len("a!") + len("bb!") + len("ccc!") = 9`
 //!     assert_eq!(total_count.load(Ordering::Acquire), 9);
+//!     Ok(())
 //! }
 //! ```
 //!

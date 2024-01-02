@@ -4,8 +4,30 @@ use std::sync::Arc;
 
 use async_pipes::{BoxedAnySend, Pipeline};
 
-/// Check that a simple, one-stage, linear pipeline can be created and can transfer data from a pipe's
-/// writer (start) to its reader (end).
+#[tokio::test]
+async fn pipeline_returns_error_on_no_producer() {
+    let error = Pipeline::builder()
+        .with_stage("one", "two", |_: ()| async move { Some(()) })
+        .with_consumer("two", |_: usize| async move {})
+        .build()
+        .unwrap_err();
+
+    assert_eq!(error, "pipeline must have at least one producer");
+}
+
+#[tokio::test]
+async fn pipeline_returns_error_on_open_ended_pipes() {
+    let error = Pipeline::builder()
+        .with_inputs("one", vec![()])
+        .with_stage("one", "two", |_: ()| async move { Some(()) })
+        .build()
+        .unwrap_err();
+
+    assert_eq!(error, "pipeline has open-ended pipe: 'two'");
+}
+
+/// Check that a simple, one-stage, linear pipeline can be created and can transfer data from a
+/// pipe's writer (start) to its reader (end).
 ///
 /// Here's the effective layout:
 ///
@@ -33,8 +55,8 @@ async fn simple_linear_pipeline() {
     assert!(written.load(Acquire), "value was not handled by worker!")
 }
 
-/// Check that a complex, multi-stage, linear pipeline can be created and can transfer data through the
-/// entire pipeline.
+/// Check that a complex, multi-stage, linear pipeline can be created and can transfer data through
+/// the entire pipeline.
 ///
 /// Here's the effective layout:
 ///
@@ -74,7 +96,8 @@ async fn complex_linear_pipeline() {
     assert!(written.load(Acquire), "value was not handled by worker!")
 }
 
-/// Test a cycle existing in the pipeline, and if the flow of content of the data is correct at each stage.
+/// Test a cycle existing in the pipeline, and if the flow of content of the data is correct at each
+/// stage.
 ///
 /// Here's the effective layout:
 ///

@@ -102,6 +102,12 @@ struct Pipe<T> {
     reader: Option<PipeReader<T>>,
 }
 
+enum Stage {
+    Producer(ProducerStage),
+    Regular(TaskStage),
+    Iterator(IterStage),
+}
+
 /// Used to construct a [Pipeline].
 ///
 /// Can be created using [Pipeline::builder].
@@ -109,9 +115,7 @@ struct Pipe<T> {
 ///
 #[derive(Default)]
 pub struct PipelineBuilder {
-    producer_fns: Vec<ProducerStage>,
-    task_fns: Vec<TaskStage>,
-    iter_fns: Vec<IterStage>,
+    stages: Vec<Stage>,
 }
 
 impl PipelineBuilder {
@@ -138,7 +142,8 @@ impl PipelineBuilder {
         )
     }
 
-    /// A "producer" stage; registers a list of multiple inputs to be written to a list of corresponding pipes.
+    /// A "producer" stage; registers a list of multiple inputs to be written to a list of
+    /// corresponding pipes.
     ///
     /// The strings provided to `pipes` define where each input will go.
     /// The values will be written one at a time into each pipe.
@@ -178,8 +183,9 @@ impl PipelineBuilder {
     ///
     /// The strings provided to `pipes` define where each input will go.
     ///
-    /// The producer will continue producing values while the user-provided task function returns [Some].
-    /// This means that it is possible to create an infinite stream of values by simply never returning [None].
+    /// The producer will continue producing values while the user-provided task function returns
+    /// [Some]. This means that it is possible to create an infinite stream of values by simply
+    /// never returning [None].
     ///
     /// # Returns
     ///
@@ -202,21 +208,24 @@ impl PipelineBuilder {
         })
     }
 
-    /// A "producer" stage; registers a new stage that produces multiple values and writes them into their
-    /// respective pipe.
+    /// A "producer" stage; registers a new stage that produces multiple values and writes them into
+    /// their respective pipe.
     ///
     /// The strings provided to `pipes` define where each input will go.
     ///
-    /// The producer will continue producing values while the user-provided task function returns [Some].
-    /// This means that it is possible to create an infinite stream of values by simply never returning [None].
+    /// The producer will continue producing values while the user-provided task function returns
+    /// [Some]. This means that it is possible to create an infinite stream of values by simply
+    /// never returning [None].
     ///
-    /// Each individual [Option] within the task output determines whether it will be sent to the corresponding
-    /// pipe. If [Some] is specified, the inner value will be sent, if [None] is specified, nothing will be sent.
+    /// Each individual [Option] within the task output determines whether it will be sent to the
+    /// corresponding pipe. If [Some] is specified, the inner value will be sent, if [None] is
+    /// specified, nothing will be sent.
     ///
-    /// As with all stages that have more than one ("branching") outputs, it's possible that each output could
-    /// have a different type, and so to avoid large binary sizes from static dispatching, dynamic dispatching
-    /// is used instead, utilizing the [BoxedAnySend] type. For examples on how to return these types of
-    /// values in task functions, see [BoxedAnySend]'s examples.
+    /// As with all stages that have more than one ("branching") outputs, it's possible that each
+    /// output could have a different type, and so to avoid large binary sizes from static
+    /// dispatching, dynamic dispatching is used instead, utilizing the [BoxedAnySend] type. For
+    /// examples on how to return these types of values in task functions, see [BoxedAnySend]'s
+    /// examples.
     ///
     /// # Returns
     ///
@@ -229,10 +238,10 @@ impl PipelineBuilder {
         Fut: Future<Output = Option<Vec<Option<BoxedAnySend>>>> + Send + 'static,
     {
         let pipes = pipes.iter().map(|p| p.as_ref().to_string()).collect();
-        self.producer_fns.push(ProducerStage {
+        self.stages.push(Stage::Producer(ProducerStage {
             function: Box::new(move || Box::pin(task())),
             pipes: ProducerPipeNames { writers: pipes },
-        });
+        }));
         self
     }
 
@@ -240,8 +249,8 @@ impl PipelineBuilder {
     ///
     /// The string provided to `pipe` define where values will be read from.
     ///
-    /// The consumer will continue consuming values until the pipeline is terminated or the pipe it is
-    /// receiving from is closed.
+    /// The consumer will continue consuming values until the pipeline is terminated or the pipe it
+    /// is receiving from is closed.
     ///
     /// # Returns
     ///
@@ -263,17 +272,18 @@ impl PipelineBuilder {
         })
     }
 
-    /// A "regular" stage; registers a new stage that operates on an input and produce a single output value
-    /// that is written to a pipe.
+    /// A "regular" stage; registers a new stage that operates on an input and produce a single
+    /// output value that is written to a pipe.
     ///
     /// The string provided to `input_pipe` defines where values will be read from.
     /// The string provided to `output_pipe` defines where the produced output will go.
     ///
-    /// The worker will continue working on input values until the pipeline is terminated or the pipe it is
-    /// receiving from is closed.
+    /// The worker will continue working on input values until the pipeline is terminated or the
+    /// pipe it is receiving from is closed.
     ///
-    /// The [Option] returned by the task function determines whether it will be sent to the output pipe.
-    /// If [Some] is specified, the inner value will be sent, if [None] is specified, nothing will be sent.
+    /// The [Option] returned by the task function determines whether it will be sent to the output
+    /// pipe. If [Some] is specified, the inner value will be sent, if [None] is specified, nothing
+    /// will be sent.
     ///
     /// # Returns
     ///
@@ -298,25 +308,26 @@ impl PipelineBuilder {
         })
     }
 
-    /// A "regular" stage; registers a new stage that operates on an input and produces multiple values that are
-    /// written into their respective pipe.
+    /// A "regular" stage; registers a new stage that operates on an input and produces multiple
+    /// values that are written into their respective pipe.
     ///
     /// The string provided to `input_pipe` defines where values will be read from.
     /// The strings provided to `output_pipes` define where each produced output will go.
     ///
-    /// The worker will continue working on input values until the pipeline is terminated or the pipe it is
-    /// receiving from is closed.
+    /// The worker will continue working on input values until the pipeline is terminated or the
+    /// pipe it is receiving from is closed.
     ///
     /// * If the user-defined task function returns [None], nothing will be done.
-    /// * If it returns [Some], the inner value ([Vec<Option<BoxedAnySend>>]) will have the following applied
-    ///   to each output option:
+    /// * If it returns [Some], the inner value ([Vec<Option<BoxedAnySend>>]) will have the
+    ///   following applied to each output option:
     ///     * If [Some] is specified, the inner value will be sent to the corresponding pipe.
     ///     * If [None] is specified, nothing will be sent.
     ///
-    /// As with all stages that have more than one ("branching") outputs, it's possible that each output could
-    /// have a different type, and so to avoid large binary sizes from static dispatching, dynamic dispatching
-    /// is used instead, utilizing the [BoxedAnySend] type. For examples on how to return these types of
-    /// values in task functions, see [BoxedAnySend]'s examples.
+    /// As with all stages that have more than one ("branching") outputs, it's possible that each
+    /// output could have a different type, and so to avoid large binary sizes from static
+    /// dispatching, dynamic dispatching is used instead, utilizing the [BoxedAnySend] type. For
+    /// examples on how to return these types of values in task functions, see [BoxedAnySend]'s
+    /// examples.
     ///
     /// # Returns
     ///
@@ -341,7 +352,7 @@ impl PipelineBuilder {
             .collect();
         let err_pipe = input_pipe.clone();
 
-        self.task_fns.push(TaskStage {
+        self.stages.push(Stage::Regular(TaskStage {
             function: Box::new(move |value: BoxedAnySend| {
                 let value = downcast_from_pipe(value, &err_pipe);
                 Box::pin(task(*value))
@@ -350,24 +361,26 @@ impl PipelineBuilder {
                 reader: input_pipe,
                 writers: output_pipes,
             },
-        });
+        }));
         self
     }
 
-    /// An "iterator-based" stage; registers a new stage that takes the data from one pipe and "flattens" it, feeding
-    /// the results into another.
+    /// An "iterator-based" stage; registers a new stage that takes the data from one pipe and
+    /// "flattens" it, feeding the results into another.
     ///
     /// This is useful if you have a pipe that produces a list of values in a single task execution,
     /// but you want to use it as input to another stage that takes only the individual values.
     ///
-    /// The generic parameter [It] is used by the pipeline builder to know what concrete type to cast the
-    /// value to, which mean turbofish syntax will be needed to specify what the iterator type of that pipe is,
-    /// for example: `Pipeline::builder().with_flattener::<Vec<u8>>("data", "bytes")`
+    /// The generic parameter [It] is used by the pipeline builder to know what concrete type to
+    /// cast the value to, which mean turbofish syntax will be needed to specify what the iterator
+    /// type of that pipe is, for example:
+    /// `Pipeline::builder().with_flattener::<Vec<u8>>("data", "bytes")`
     ///
     /// The string provided to `from_pipe` defines where the iterator of values will be read from.
     /// The string provided to `to_pipe` defines where the individual values will go.
     ///
-    /// The worker will continue working until the pipeline is terminated or the pipe it is receiving from is closed.
+    /// The worker will continue working until the pipeline is terminated or the pipe it is
+    /// receiving from is closed.
     ///
     /// # Examples
     ///
@@ -416,7 +429,7 @@ impl PipelineBuilder {
         let output_pipe = to_pipe.as_ref().to_string();
         let err_pipe = input_pipe.clone();
 
-        self.iter_fns.push(IterStage {
+        self.stages.push(Stage::Iterator(IterStage {
             stage_type: IterStageType::Flatten,
             caster: Box::new(move |value: BoxedAnySend| {
                 downcast_from_pipe::<It>(value, &err_pipe)
@@ -428,17 +441,18 @@ impl PipelineBuilder {
                 reader: input_pipe,
                 writers: vec![output_pipe],
             },
-        });
+        }));
         self
     }
 
     /// When the pipeline is ready to be built, this is called and will return a pipeline if
-    /// it was successfully built, otherwise it will return an error describing why it could not be built.
+    /// it was successfully built, otherwise it will return an error describing why it could not be
+    /// built.
     ///
     /// # Errors
     ///
-    /// 1. A pipe was specified as an "output" pipe for a stage and it doesn't exist
-    /// 2. The reader of a pipe was used more than once
+    /// 1. A pipe is "open-ended", meaning there's no stage consuming values from that pipe.
+    /// 2. The reader of a pipe was used more than once.
     ///
     pub fn build(self) -> Result<Pipeline, String> {
         // Create pipe IDs and register them in the synchronizer
@@ -453,41 +467,49 @@ impl PipelineBuilder {
         let mut workers = JoinSet::new();
         let mut signal_txs = Vec::new();
 
-        let mut worker_args = |pipe_names: TaskPipeNames| {
-            let writers = find_writers(&pipe_names.writers, &pipes)?;
-            let reader = find_reader(&pipe_names.reader, &mut pipes)?;
+        let mut worker_args =
+            |pipe_names: TaskPipeNames, pipes: &mut HashMap<String, Pipe<BoxedAnySend>>| {
+                let writers = find_writers(&pipe_names.writers, pipes)?;
+                let reader = find_reader(&pipe_names.reader, pipes)?;
 
-            let (signal_tx, signal_rx) = channel(1);
-            signal_txs.push(signal_tx);
+                let (signal_tx, signal_rx) = channel(1);
+                signal_txs.push(signal_tx);
 
-            Result::<_, String>::Ok((reader, writers, signal_rx))
-        };
+                Result::<_, String>::Ok((reader, writers, signal_rx))
+            };
 
-        // Spawn task workers
-        for task in self.task_fns {
-            let (reader, writers, signal_rx) = worker_args(task.pipes)?;
-            workers.spawn(Self::new_detached_worker(
-                task.function,
-                reader,
-                writers,
-                signal_rx,
-            ));
-        }
-
-        // Spawn iterator-based workers
-        for iter in self.iter_fns {
-            let (reader, writers, signal_rx) = worker_args(iter.pipes)?;
-            workers.spawn(match iter.stage_type {
-                IterStageType::Flatten => {
-                    Self::new_detached_flattener(iter.caster, reader, writers, signal_rx)
+        let mut has_producer = false;
+        for stage in self.stages {
+            match stage {
+                Stage::Producer(producer) => {
+                    let writers = find_writers(&producer.pipes.writers, &pipes)?;
+                    has_producer = true;
+                    producers.spawn(Self::new_detached_producer(producer.function, writers));
                 }
-            });
+
+                Stage::Regular(task) => {
+                    let (reader, writers, signal_rx) = worker_args(task.pipes, &mut pipes)?;
+                    workers.spawn(Self::new_detached_worker(
+                        task.function,
+                        reader,
+                        writers,
+                        signal_rx,
+                    ));
+                }
+
+                Stage::Iterator(iter) => {
+                    let (reader, writers, signal_rx) = worker_args(iter.pipes, &mut pipes)?;
+                    workers.spawn(match iter.stage_type {
+                        IterStageType::Flatten => {
+                            Self::new_detached_flattener(iter.caster, reader, writers, signal_rx)
+                        }
+                    });
+                }
+            }
         }
 
-        // Spawn producer workers
-        for producer in self.producer_fns {
-            let writers = find_writers(&producer.pipes.writers, &pipes)?;
-            producers.spawn(Self::new_detached_producer(producer.function, writers));
+        if !has_producer {
+            return Err("pipeline must have at least one producer".to_string());
         }
 
         Ok(Pipeline {
@@ -512,19 +534,24 @@ impl PipelineBuilder {
 
     /// Collect the names of all the pipes.
     ///
-    /// We can achieve a set of unique names easily by using the `reader` of the "task" and "iter" stages
-    /// and de-duplicating that list.
+    /// We can achieve a set of unique names easily by using the `reader` of the "task" and "iter"
+    /// stages and de-duplicating that list.
     ///
     /// For each pipe, there is only one reader, but there can be multiple writers.
     /// Also, producers do not have a reader, only writers.
     fn names(&self) -> Vec<String> {
         let mut names = HashSet::new();
 
-        for name in self.iter_fns.iter().map(|f| &f.pipes.reader) {
-            names.insert(name.clone());
-        }
-        for name in self.task_fns.iter().map(|f| &f.pipes.reader) {
-            names.insert(name.clone());
+        for stage in &self.stages {
+            match stage {
+                Stage::Regular(task) => {
+                    names.insert(task.pipes.reader.clone());
+                }
+                Stage::Iterator(iter) => {
+                    names.insert(iter.pipes.reader.clone());
+                }
+                _ => {}
+            };
         }
 
         names.into_iter().collect()
@@ -665,8 +692,8 @@ impl PipelineBuilder {
     }
 }
 
-/// A pipeline provides the infrastructure for managing a set of workers that run user-defined "tasks" on
-/// data going through the pipes.
+/// A pipeline provides the infrastructure for managing a set of workers that run user-defined
+/// "tasks" on data going through the pipes.
 ///
 /// # Examples
 ///
@@ -790,8 +817,9 @@ impl Pipeline {
     ///
     /// A pipeline progresses to completion by doing the following:
     ///   1. Wait for all "producers" to complete while also progressing stage workers
-    ///   2. Wait for either all the stage workers to complete, or wait for the internal synchronizer to notify
-    ///      of completion (i.e. there's no more data flowing through the pipeline)
+    ///   2. Wait for either all the stage workers to complete, or wait for the internal
+    ///      synchronizer to notify of completion (i.e. there's no more data flowing through the
+    ///      pipeline)
     ///
     /// Step 1 implies that if the producers never finish, the pipeline will run forever. See
     /// [Pipeline::register_producer] for more info.
@@ -825,7 +853,8 @@ impl Pipeline {
         // We do this to prevent the synchronizer from causing the pipeline to shutdown too early.
         select! {
             _ = wait_for_producers => {},
-            _ = wait_for_workers(workers_to_progress), if !workers_to_progress.lock().await.is_empty() => {},
+            _ = wait_for_workers(workers_to_progress),
+                if !workers_to_progress.lock().await.is_empty() => {},
         }
 
         // If either the synchronizer determines we're done, or all workers completed, we're done
@@ -842,7 +871,7 @@ fn find_reader(
 ) -> Result<PipeReader<BoxedAnySend>, String> {
     Ok(pipes
         .get_mut(name)
-        .ok_or(&format!("no pipe with name {} found", name))?
+        .unwrap_or_else(|| panic!("no pipe with name '{}' found", name))
         .reader
         .take()
         .ok_or("reader was already used")?)
@@ -854,7 +883,7 @@ fn find_writer(
 ) -> Result<PipeWriter<BoxedAnySend>, String> {
     Ok(pipes
         .get(name)
-        .ok_or(&format!("no pipe with name {} found", name))?
+        .ok_or(&format!("pipeline has open-ended pipe: '{}'", name))?
         .writer
         .clone())
 }

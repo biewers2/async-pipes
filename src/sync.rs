@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::{Acquire, SeqCst};
+use std::sync::atomic::Ordering::{AcqRel, Acquire};
 
 /// A generic data structure to synchronize tasks being done among multiple threads.
 ///
-/// The IDs of the tasks must be registered in order to be tracked. Tasks can be marked as "started" or
-/// "ended" which increments and decrements (respectively) the respective task ID counter. A synchronizer
-/// is considered "complete" if all task ID counters are zero.
+/// The IDs of the tasks must be registered in order to be tracked. Tasks can be marked as "started"
+/// or "ended" which increments and decrements (respectively) the respective task ID counter. A
+/// synchronizer is considered "complete" if all task ID counters are zero.
 #[derive(Default, Debug)]
 pub struct Synchronizer {
     /// Maintain a total count to easily check if all task ID counters are zero
@@ -25,8 +25,8 @@ impl Synchronizer {
 
     pub fn started_many<S: AsRef<str>>(&self, id: S, n: usize) {
         if let Some(count) = self.counts.get(id.as_ref()) {
-            count.fetch_add(n, SeqCst);
-            self.total_count.fetch_add(n, SeqCst);
+            count.fetch_add(n, AcqRel);
+            self.total_count.fetch_add(n, AcqRel);
         }
     }
 
@@ -36,8 +36,8 @@ impl Synchronizer {
 
     pub fn ended_many<S: AsRef<str>>(&self, id: S, n: usize) {
         if let Some(count) = self.counts.get(id.as_ref()) {
-            count.fetch_sub(n, SeqCst);
-            self.total_count.fetch_sub(n, SeqCst);
+            count.fetch_sub(n, AcqRel);
+            self.total_count.fetch_sub(n, AcqRel);
         }
     }
 
