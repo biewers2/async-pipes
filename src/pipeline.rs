@@ -318,7 +318,7 @@ impl PipelineBuilder {
     /// pipe it is receiving from is closed.
     ///
     /// * If the user-defined task function returns [None], nothing will be done.
-    /// * If it returns [Some], the inner value ([Vec<Option<BoxedAnySend>>]) will have the
+    /// * If it returns [Some], the inner value ([`Vec<Option<BoxedAnySend>>`]) will have the
     ///   following applied to each output option:
     ///     * If [Some] is specified, the inner value will be sent to the corresponding pipe.
     ///     * If [None] is specified, nothing will be sent.
@@ -371,7 +371,7 @@ impl PipelineBuilder {
     /// This is useful if you have a pipe that produces a list of values in a single task execution,
     /// but you want to use it as input to another stage that takes only the individual values.
     ///
-    /// The generic parameter [It] is used by the pipeline builder to know what concrete type to
+    /// The generic parameter is used by the pipeline builder to know what concrete type to
     /// cast the value to, which mean turbofish syntax will be needed to specify what the iterator
     /// type of that pipe is, for example:
     /// `Pipeline::builder().with_flattener::<Vec<u8>>("data", "bytes")`
@@ -822,7 +822,7 @@ impl Pipeline {
     ///      pipeline)
     ///
     /// Step 1 implies that if the producers never finish, the pipeline will run forever. See
-    /// [Pipeline::register_producer] for more info.
+    /// [PipelineBuilder::with_producer] for more info.
     pub async fn wait(mut self) {
         let workers_to_progress = Arc::new(Mutex::new(self.workers));
         let workers_to_finish = workers_to_progress.clone();
