@@ -1,3 +1,19 @@
+## 0.2.1 (Jan 2, 2024)
+
+Primary feature: added `flattener` stage. Additionally, made various tweaks to code and documentation.
+
+**Feature(s):**
+* Add `PipelineBuilder::with_flattener`.
+* Add "Getting Started" section to documentation.
+* Add well-defined error messages for `PipelineBuilder::build`, including a new error when there is
+  no producer stage.
+
+**Fixes:**
+* Update link to docs in `README.md` to point to latest version.
+* Fixed mal-formatted documentation in `PipelineBuilder`.
+* Use `Drop` trait for decrement internal synchronizer in case of task error.
+* Use pipe names as their IDs, as their uniqueness is an invariant to the pipeline builder's logic.
+
 ## 0.2.0 (Dec 31, 2023)
 
 Complete redesign of how pipelines are built. Using the same understanding of how to manage and run workers/tasks,

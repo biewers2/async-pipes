@@ -2,20 +2,31 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::sync;
+use crate::sync::Synchronizer;
+
+pub struct Consumed {
+    id: String,
+    sync: Arc<Synchronizer>,
+}
+
+impl Drop for Consumed {
+    fn drop(&mut self) {
+        self.sync.ended(&self.id)
+    }
+}
 
 /// Defines an end to a pipe that allows data to be received from.
 #[derive(Debug)]
 pub struct PipeReader<T> {
     pipe_id: String,
-    synchronizer: Arc<sync::Synchronizer>,
+    synchronizer: Arc<Synchronizer>,
     rx: Receiver<T>,
 }
 
 impl<T> PipeReader<T> {
     pub fn new(
         pipe_id: impl Into<String>,
-        synchronizer: Arc<sync::Synchronizer>,
+        synchronizer: Arc<Synchronizer>,
         input_rx: Receiver<T>,
     ) -> Self {
         Self {
@@ -32,15 +43,17 @@ impl<T> PipeReader<T> {
     ///
     /// We use a callback function here so it can be passed and called in the task definition
     /// without having to give ownership of this reader to the task definition.
-    pub fn consumed_callback(&self) -> impl FnOnce() {
-        let id = self.pipe_id.clone();
-        let sync = self.synchronizer.clone();
-        move || sync.ended(id)
-    }
 
     /// Receive the next value from the inner receiver.
-    pub async fn read(&mut self) -> Option<T> {
-        self.rx.recv().await
+    pub async fn read(&mut self) -> Option<(T, Consumed)> {
+        self.rx.recv().await.map(|v| (v, self.consumed()))
+    }
+
+    fn consumed(&self) -> Consumed {
+        Consumed {
+            id: self.pipe_id.clone(),
+            sync: self.synchronizer.clone(),
+        }
     }
 }
 
@@ -48,7 +61,7 @@ impl<T> PipeReader<T> {
 #[derive(Debug)]
 pub struct PipeWriter<T> {
     pipe_id: String,
-    synchronizer: Arc<sync::Synchronizer>,
+    synchronizer: Arc<Synchronizer>,
     tx: Sender<T>,
 }
 
@@ -67,7 +80,7 @@ impl<T> Clone for PipeWriter<T> {
 impl<T> PipeWriter<T> {
     pub fn new(
         pipe_id: impl Into<String>,
-        synchronizer: Arc<sync::Synchronizer>,
+        synchronizer: Arc<Synchronizer>,
         output_tx: Sender<T>,
     ) -> Self {
         Self {
@@ -96,21 +109,24 @@ mod tests {
 
     use crate::sync::Synchronizer;
 
-    #[test]
-    fn test_input_consumed_callback_updates_sync() {
+    #[tokio::test]
+    async fn test_read_consumed_updates_sync_on_drop() {
         let id = "pipe-id";
         let mut sync = Synchronizer::default();
         sync.register(id);
         sync.started_many(id, 4);
 
         let sync = Arc::new(sync);
-        let (_, rx) = channel::<()>(1);
-        let input = PipeReader::new(id, sync.clone(), rx);
+        let (tx, rx) = channel::<()>(1);
 
-        let callback = input.consumed_callback();
+        let mut input = PipeReader::new(id, sync.clone(), rx);
 
-        assert_eq!(sync.get(id), 4);
-        callback();
+        tx.send(()).await.unwrap();
+
+        {
+            let (_, _c) = input.read().await.unwrap();
+            assert_eq!(sync.get(id), 4);
+        }
         assert_eq!(sync.get(id), 3);
     }
 }

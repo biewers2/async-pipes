@@ -13,7 +13,7 @@ For information on getting started with Async Pipes, see the [documentation](#do
 
 ## Documentation
 
-[Async Pipes - Docs.rs](https://docs.rs/async-pipes/0.1.0/async_pipes/)
+[Async Pipes - Docs.rs](https://docs.rs/async-pipes/latest/async_pipes/)
 
 #### Simple, Linear Pipeline Example
 
