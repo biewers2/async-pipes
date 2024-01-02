@@ -129,10 +129,6 @@ mod io;
 mod pipeline;
 mod sync;
 
-fn new_id() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
 /// Signals sent to stage workers.
 ///
 /// Useful for interrupting the natural workflow to tell it something.

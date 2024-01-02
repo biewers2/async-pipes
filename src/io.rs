@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::sync;
 use crate::sync::Synchronizer;
 
 pub struct Consumed {
@@ -20,14 +19,14 @@ impl Drop for Consumed {
 #[derive(Debug)]
 pub struct PipeReader<T> {
     pipe_id: String,
-    synchronizer: Arc<sync::Synchronizer>,
+    synchronizer: Arc<Synchronizer>,
     rx: Receiver<T>,
 }
 
 impl<T> PipeReader<T> {
     pub fn new(
         pipe_id: impl Into<String>,
-        synchronizer: Arc<sync::Synchronizer>,
+        synchronizer: Arc<Synchronizer>,
         input_rx: Receiver<T>,
     ) -> Self {
         Self {
@@ -61,9 +60,8 @@ impl<T> PipeReader<T> {
 /// Defines an end to a pipe that allows data to be sent through.
 #[derive(Debug)]
 pub struct PipeWriter<T> {
-    name: String,
     pipe_id: String,
-    synchronizer: Arc<sync::Synchronizer>,
+    synchronizer: Arc<Synchronizer>,
     tx: Sender<T>,
 }
 
@@ -72,7 +70,6 @@ pub struct PipeWriter<T> {
 impl<T> Clone for PipeWriter<T> {
     fn clone(&self) -> Self {
         Self {
-            name: self.name.clone(),
             pipe_id: self.pipe_id.clone(),
             synchronizer: self.synchronizer.clone(),
             tx: self.tx.clone(),
@@ -82,13 +79,11 @@ impl<T> Clone for PipeWriter<T> {
 
 impl<T> PipeWriter<T> {
     pub fn new(
-        name: impl Into<String>,
         pipe_id: impl Into<String>,
-        synchronizer: Arc<sync::Synchronizer>,
+        synchronizer: Arc<Synchronizer>,
         output_tx: Sender<T>,
     ) -> Self {
         Self {
-            name: name.into(),
             pipe_id: pipe_id.into(),
             synchronizer,
             tx: output_tx,
