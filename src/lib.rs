@@ -138,14 +138,6 @@ fn new_id() -> String {
 /// Useful for interrupting the natural workflow to tell it something.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 enum StageWorkerSignal {
-    /// For now, this is a placeholder signal and marked as dead code.
-    ///
-    /// This is to avoid a compiler error in [Pipeline::new_stage_worker] where the loop
-    /// complains about never having another iteration due to all other branches breaking
-    /// within the `select!`.
-    #[allow(dead_code)]
-    Ping,
-
     /// Used to tell stage workers to finish immediately without waiting for remaining tasks to end.
     Terminate,
 }
@@ -156,7 +148,6 @@ impl Display for StageWorkerSignal {
             f,
             "{}",
             match self {
-                Self::Ping => "SIGPING",
                 Self::Terminate => "SIGTERM",
             }
         )

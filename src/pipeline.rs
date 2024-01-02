@@ -1,6 +1,7 @@
 use std::any::{type_name, Any};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::panic;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -26,7 +27,6 @@ use crate::{new_id, StageWorkerSignal};
 /// Here's an example of a closure representing the task function given to the pipeline builder
 /// when creating a "branching" stage. Three outputs are returned, each of a different type.
 /// ```
-/// use std::ops::Deref;
 /// use async_pipes::BoxedAnySend;
 ///
 /// tokio_test::block_on(async {
@@ -60,11 +60,11 @@ use crate::{new_id, StageWorkerSignal};
 /// ```
 pub type BoxedAnySend = Box<dyn Any + Send + 'static>;
 
-type TaskFuture = Pin<Box<dyn Future<Output = Option<Vec<TaskFutureOutput>>> + Send + 'static>>;
-type TaskFutureOutput = Option<BoxedAnySend>;
-
 type ProducerFn = Box<dyn FnMut() -> TaskFuture + Send + 'static>;
 type TaskFn = Box<dyn Fn(BoxedAnySend) -> TaskFuture + Send + Sync + 'static>;
+type IterCastFn = Box<dyn Fn(BoxedAnySend) -> Vec<BoxedAnySend> + Send + 'static>;
+
+type TaskFuture = Pin<Box<dyn Future<Output = Option<Vec<Option<BoxedAnySend>>>> + Send + 'static>>;
 
 struct ProducerStage {
     function: ProducerFn,
@@ -85,6 +85,16 @@ struct TaskPipeNames {
     writers: Vec<String>,
 }
 
+struct IterStage {
+    stage_type: IterStageType,
+    caster: IterCastFn,
+    pipes: TaskPipeNames,
+}
+
+enum IterStageType {
+    Flatten,
+}
+
 struct Pipe<T> {
     writer: PipeWriter<T>,
     /// Use an option here to "take" it when a reader is used.
@@ -101,6 +111,7 @@ struct Pipe<T> {
 pub struct PipelineBuilder {
     producer_fns: Vec<ProducerStage>,
     task_fns: Vec<TaskStage>,
+    iter_fns: Vec<IterStage>,
 }
 
 impl PipelineBuilder {
@@ -134,15 +145,19 @@ impl PipelineBuilder {
     ///
     /// For example, say you have the following:
     ///
-    /// `List of multiple inputs: [ [1, "hi", true], [2, "bye", false], [3, ".", false] ]`
-    /// `List of pipes: [ "numbers", "strings", "bools" ]`
+    /// ```text
+    /// List of multiple inputs: [ [1, "hi", true], [2, "bye", false], [3, ".", false] ]
+    /// List of pipes: [ "numbers", "strings", "bools" ]
+    /// ```
     ///
     /// The inputs would be sent to the pipes like this:
     ///
-    /// `Pipe         1st   2nd    3rd`
-    /// `"numbers" <- 1     2      3`
-    /// `"strings" <- "hi"  "bye"  "."`
-    /// `"bools"   <- true  false  false`
+    /// ```text
+    /// Pipe         1st   2nd    3rd
+    /// "numbers" <- 1     2      3
+    /// "strings" <- "hi"  "bye"  "."
+    /// "bools"   <- true  false  false
+    /// ```
     ///
     /// # Returns
     ///
@@ -345,6 +360,51 @@ impl PipelineBuilder {
         self
     }
 
+    pub fn with_flattener<It>(self, from_pipe: impl AsRef<str>, to_pipe: impl AsRef<str>) -> Self
+    where
+        It: IntoIterator + Send + 'static,
+        It::Item: Send,
+    {
+        self.with_branching_flattener::<It>(from_pipe, vec![to_pipe])
+    }
+
+    pub fn with_branching_flattener<It>(
+        mut self,
+        from_pipe: impl AsRef<str>,
+        to_pipes: Vec<impl AsRef<str>>,
+    ) -> Self
+    where
+        It: IntoIterator + Send + 'static,
+        It::Item: Send,
+    {
+        let input_pipe = from_pipe.as_ref().to_string();
+        let output_pipes = to_pipes.iter().map(|p| p.as_ref().to_string()).collect();
+        let err_pipe = input_pipe.clone();
+
+        self.iter_fns.push(IterStage {
+            stage_type: IterStageType::Flatten,
+            caster: Box::new(move |value: BoxedAnySend| {
+                value
+                    .downcast::<It>()
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "failed to downcast input value to {} from pipe '{}'",
+                            type_name::<It>(),
+                            err_pipe
+                        )
+                    })
+                    .into_iter()
+                    .map(|v| Box::new(v) as BoxedAnySend)
+                    .collect()
+            }),
+            pipes: TaskPipeNames {
+                reader: input_pipe,
+                writers: output_pipes,
+            },
+        });
+        self
+    }
+
     /// When the pipeline is ready to be built, this is called and will return a pipeline if
     /// it was successfully built, otherwise it will return an error describing why it could not be built.
     ///
@@ -366,28 +426,41 @@ impl PipelineBuilder {
         let mut workers = JoinSet::new();
         let mut signal_txs = Vec::new();
 
-        // Spawn producer workers
-        for producer in self.producer_fns {
-            let writers = Self::find_writers(&producer.pipes.writers, &pipes)?;
-            producers.spawn(Self::new_detached_producer(producer.function, writers));
-        }
-
-        // Spawn task workers
-        for task in self.task_fns {
-            let writers = Self::find_writers(&task.pipes.writers, &pipes)?;
-
-            let reader_name = &task.pipes.reader;
-            let reader = Self::find_reader(reader_name, &mut pipes)?;
+        let mut worker_args = |pipe_names: TaskPipeNames| {
+            let writers = find_writers(&pipe_names.writers, &pipes)?;
+            let reader = find_reader(&pipe_names.reader, &mut pipes)?;
 
             let (signal_tx, signal_rx) = channel(1);
             signal_txs.push(signal_tx);
 
+            Result::<_, String>::Ok((reader, writers, signal_rx))
+        };
+
+        // Spawn task workers
+        for task in self.task_fns {
+            let (reader, writers, signal_rx) = worker_args(task.pipes)?;
             workers.spawn(Self::new_detached_worker(
                 task.function,
                 reader,
                 writers,
                 signal_rx,
             ));
+        }
+
+        // Spawn iterator-based workers
+        for iter in self.iter_fns {
+            let (reader, writers, signal_rx) = worker_args(iter.pipes)?;
+            workers.spawn(match iter.stage_type {
+                IterStageType::Flatten => {
+                    Self::new_detached_flattener(iter.caster, reader, writers, signal_rx)
+                }
+            });
+        }
+
+        // Spawn producer workers
+        for producer in self.producer_fns {
+            let writers = find_writers(&producer.pipes.writers, &pipes)?;
+            producers.spawn(Self::new_detached_producer(producer.function, writers));
         }
 
         Ok(Pipeline {
@@ -422,70 +495,34 @@ impl PipelineBuilder {
         let mut pipes = HashMap::new();
         for (name, id) in ids {
             let (tx, rx) = channel(10);
-            pipes.insert(
-                name,
-                Pipe {
-                    writer: PipeWriter::new(&id, sync.clone(), tx),
-                    reader: Some(PipeReader::new(&id, sync.clone(), rx)),
-                },
-            );
+            let pipe = Pipe {
+                writer: PipeWriter::new(&name, &id, sync.clone(), tx),
+                reader: Some(PipeReader::new(&id, sync.clone(), rx)),
+            };
+            pipes.insert(name, pipe);
         }
         pipes
     }
 
     fn names(&self) -> Vec<&String> {
         let mut names = HashSet::new();
-        for f in &self.task_fns {
-            names.insert(&f.pipes.reader);
+
+        for name in self.iter_fns.iter().map(|f| &f.pipes.reader) {
+            names.insert(name);
         }
+        for name in self.task_fns.iter().map(|f| &f.pipes.reader) {
+            names.insert(name);
+        }
+
         names.into_iter().collect()
-    }
-
-    fn find_writers(
-        writer_names: &[String],
-        pipes: &HashMap<String, Pipe<BoxedAnySend>>,
-    ) -> Result<Vec<PipeWriter<BoxedAnySend>>, String> {
-        let mut writers = Vec::new();
-        for writer_name in writer_names {
-            writers.push(Self::find_writer(writer_name, &pipes)?);
-        }
-        Ok(writers)
-    }
-
-    fn find_reader(
-        name: &str,
-        pipes: &mut HashMap<String, Pipe<BoxedAnySend>>,
-    ) -> Result<PipeReader<BoxedAnySend>, String> {
-        Ok(pipes
-            .get_mut(name)
-            .ok_or(&format!("no pipe with name {} found", name))?
-            .reader
-            .take()
-            .ok_or("reader was already used")?)
-    }
-
-    fn find_writer(
-        name: &str,
-        pipes: &HashMap<String, Pipe<BoxedAnySend>>,
-    ) -> Result<PipeWriter<BoxedAnySend>, String> {
-        Ok(pipes
-            .get(name)
-            .ok_or(&format!("no pipe with name {} found", name))?
-            .writer
-            .clone())
     }
 
     async fn new_detached_producer(
         mut producer: ProducerFn,
         writers: Vec<PipeWriter<BoxedAnySend>>,
     ) {
-        loop {
-            let writers = writers.clone();
-            if let Some(results) = (*producer)().await {
-                write_results(writers, results).await;
-            } else {
-                break;
-            }
+        while let Some(results) = (*producer)().await {
+            write_results(&writers, results).await;
         }
     }
 
@@ -499,32 +536,29 @@ impl PipelineBuilder {
 
         loop {
             select! {
-                Some(value) = reader.read() => {
-                    let consumed = reader.consumed_callback();
+                Some((value, consumed)) = reader.read() => {
                     let writers = writers.clone();
-                    let result = task(value);
+                    let results = task(value);
 
                     tasks.spawn(async move {
-                        if let Some(results) = result.await {
-                            write_results(writers, results).await;
-                        }
+                        // Take ownership in order to drop it once task ends
+                        let _c = consumed;
 
-                        // Mark input as consumed *after* writing outputs
-                        // (avoids false positive of completed pipeline)
-                        consumed();
+                        if let Some(results) = results.await {
+                            write_results(&writers, results).await;
+                        }
                     });
                 }
 
                 // Join tasks to check for errors
                 Some(result) = tasks.join_next(), if !tasks.is_empty() => {
-                    check_join_result(&result);
+                    check_join_result(result);
                 }
 
                 // Receive external signals
                 Some(signal) = signal_rx.recv() => {
                     match signal {
                         StageWorkerSignal::Terminate => break,
-                        StageWorkerSignal::Ping => println!("Pong!"),
                     }
                 },
             }
@@ -532,10 +566,35 @@ impl PipelineBuilder {
 
         tasks.shutdown().await;
     }
+
+    async fn new_detached_flattener(
+        caster: IterCastFn,
+        mut reader: PipeReader<BoxedAnySend>,
+        writers: Vec<PipeWriter<BoxedAnySend>>,
+        mut signal_rx: Receiver<StageWorkerSignal>,
+    ) {
+        loop {
+            select! {
+                Some((value, _c)) = reader.read() => {
+                    let values = caster(value);
+                    for value in values {
+                        write_results(&writers, vec![Some(value)]).await;
+                    }
+                }
+
+                // Receive external signals
+                Some(signal) = signal_rx.recv() => {
+                    match signal {
+                        StageWorkerSignal::Terminate => break,
+                    }
+                },
+            }
+        }
+    }
 }
 
-/// A pipeline provides the infrastructure for managing a set of workers that operate on and
-/// transfer data between them using pipes.
+/// A pipeline provides the infrastructure for managing a set of workers that run user-defined "tasks" on
+/// data going through the pipes.
 ///
 /// # Examples
 ///
@@ -556,21 +615,21 @@ impl PipelineBuilder {
 ///     Pipeline::builder()
 ///         // Produce values 1 through 10
 ///         .with_producer("data", move || {
-///             let c = count.clone();
+///             let count = count.clone();
 ///             async move {
-///                 let mut c = c.lock().await;
-///                 if *c < 10 {
-///                     *c += 1;
-///                     Some(*c)
+///                 let mut count = count.lock().await;
+///                 if *count < 10 {
+///                     *count += 1;
+///                     Some(*count)
 ///                 } else {
 ///                     None
 ///                 }
 ///             }
 ///         })
 ///         .with_consumer("data", move |value: usize| {
-///             let ts = task_sum.clone();
+///             let sum = task_sum.clone();
 ///             async move {
-///                 ts.fetch_add(value, SeqCst);
+///                 sum.fetch_add(value, SeqCst);
 ///             }
 ///         })
 ///         .build()
@@ -670,12 +729,12 @@ impl Pipeline {
 
         let wait_for_producers = async {
             while let Some(result) = self.producers.join_next().await {
-                check_join_result(&result);
+                check_join_result(result);
             }
         };
         let wait_for_workers = |workers: Arc<Mutex<JoinSet<()>>>| async move {
             while let Some(result) = workers.lock().await.join_next().await {
-                check_join_result(&result);
+                check_join_result(result);
             }
         };
         let check_sync_completed = async {
@@ -705,7 +764,41 @@ impl Pipeline {
     }
 }
 
-async fn write_results<O>(writers: Vec<PipeWriter<O>>, results: Vec<Option<O>>) {
+fn find_reader(
+    name: &str,
+    pipes: &mut HashMap<String, Pipe<BoxedAnySend>>,
+) -> Result<PipeReader<BoxedAnySend>, String> {
+    Ok(pipes
+        .get_mut(name)
+        .ok_or(&format!("no pipe with name {} found", name))?
+        .reader
+        .take()
+        .ok_or("reader was already used")?)
+}
+
+fn find_writer(
+    name: &str,
+    pipes: &HashMap<String, Pipe<BoxedAnySend>>,
+) -> Result<PipeWriter<BoxedAnySend>, String> {
+    Ok(pipes
+        .get(name)
+        .ok_or(&format!("no pipe with name {} found", name))?
+        .writer
+        .clone())
+}
+
+fn find_writers(
+    names: &[String],
+    pipes: &HashMap<String, Pipe<BoxedAnySend>>,
+) -> Result<Vec<PipeWriter<BoxedAnySend>>, String> {
+    let mut writers = Vec::new();
+    for name in names {
+        writers.push(find_writer(name, pipes)?);
+    }
+    Ok(writers)
+}
+
+async fn write_results<O>(writers: &[PipeWriter<O>], results: Vec<Option<O>>) {
     for (i, value) in results.into_iter().enumerate() {
         if let Some(result) = value {
             writers
@@ -717,24 +810,23 @@ async fn write_results<O>(writers: Vec<PipeWriter<O>>, results: Vec<Option<O>>) 
     }
 }
 
-fn check_join_result<T>(result: &Result<T, JoinError>) {
+fn check_join_result<T>(result: Result<T, JoinError>) {
     if let Err(e) = result {
         if e.is_panic() {
-            // TODO - figure out to get `select!` to NOT provide a borrowed result
-            // panic::resume_unwind(e.into_panic())
-            std::panic!("task panicked!")
+            panic::resume_unwind(e.into_panic())
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::Ordering::{Acquire, Release};
+    use std::sync::atomic::Ordering::{Acquire, Release, SeqCst};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::Arc;
     use std::time::Duration;
 
-    use tokio::join;
+    use tokio::select;
+    use tokio::sync::mpsc::channel;
 
     use crate::{Pipeline, StageWorkerSignal};
 
@@ -794,6 +886,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stage_flattener() {
+        let sum = Arc::new(AtomicUsize::new(0));
+        let task_sum = sum.clone();
+
+        Pipeline::builder()
+            .with_inputs("first", vec![vec![1usize, 2usize, 3usize]])
+            .with_flattener::<Vec<usize>>("first", "second")
+            .with_consumer("second", move |value: usize| {
+                let sum = task_sum.clone();
+                async move {
+                    sum.fetch_add(value, SeqCst);
+                }
+            })
+            .build()
+            .unwrap()
+            .wait()
+            .await;
+
+        assert_eq!(sum.load(Acquire), 6);
+    }
+
+    #[tokio::test]
     #[should_panic]
     async fn test_stage_propagates_task_panic() {
         Pipeline::builder()
@@ -807,19 +921,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_stage_receives_signal_terminate() {
+        let (tx, mut rx) = channel(1);
+
         let pipeline = Pipeline::builder()
             .with_inputs("pipe", vec![()])
-            .with_consumer("pipe", |_: ()| async move {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                panic!("worker did not terminate!");
+            .with_consumer("pipe", move |_: ()| {
+                let tx = tx.clone();
+                async move {
+                    tx.send(()).await.unwrap();
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    panic!("worker did not terminate!");
+                }
             })
             .build()
             .unwrap();
 
         let signaller = pipeline.signal_txs.first().unwrap().clone();
-        let _ = join!(
-            pipeline.wait(),
-            signaller.send(StageWorkerSignal::Terminate),
-        );
+        select! {
+            _ = pipeline.wait() => {},
+            _ = rx.recv() => {
+                signaller.send(StageWorkerSignal::Terminate).await.unwrap();
+            }
+        }
     }
 }
