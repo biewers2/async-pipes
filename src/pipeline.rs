@@ -14,7 +14,7 @@ use crate::io::{PipeReader, PipeWriter};
 use crate::sync::Synchronizer;
 use crate::StageWorkerSignal;
 
-/// A Box that can hold any value ([Any]) that is also [Send].
+/// A Box that can hold any value that is [Send].
 ///
 /// Values sent through pipes are trait objects of this type.
 ///
@@ -98,7 +98,7 @@ enum IterStageType {
 struct Pipe<T> {
     writer: PipeWriter<T>,
     /// Use an option here to "take" it when a reader is used.
-    /// Only allow one reader per stage.
+    /// Only allow one reader per pipe.
     reader: Option<PipeReader<T>>,
 }
 
@@ -343,14 +343,8 @@ impl PipelineBuilder {
 
         self.task_fns.push(TaskStage {
             function: Box::new(move |value: BoxedAnySend| {
-                let v = value.downcast::<I>().unwrap_or_else(|_| {
-                    panic!(
-                        "failed to downcast input value to {} from pipe '{}'",
-                        type_name::<I>(),
-                        err_pipe
-                    )
-                });
-                Box::pin(task(*v))
+                let value = downcast_from_pipe(value, &err_pipe);
+                Box::pin(task(*value))
             }),
             pipes: TaskPipeNames {
                 reader: input_pipe,
@@ -408,46 +402,31 @@ impl PipelineBuilder {
     ///
     /// This pipeline builder.
     ///
-    pub fn with_flattener<It>(self, from_pipe: impl AsRef<str>, to_pipe: impl AsRef<str>) -> Self
-    where
-        It: IntoIterator + Send + 'static,
-        It::Item: Send,
-    {
-        self.with_branching_flattener::<It>(from_pipe, vec![to_pipe])
-    }
-
-    pub fn with_branching_flattener<It>(
+    pub fn with_flattener<It>(
         mut self,
         from_pipe: impl AsRef<str>,
-        to_pipes: Vec<impl AsRef<str>>,
+        to_pipe: impl AsRef<str>,
     ) -> Self
     where
         It: IntoIterator + Send + 'static,
         It::Item: Send,
     {
+        // self.with_branching_flattener::<It>(from_pipe, vec![to_pipe])
         let input_pipe = from_pipe.as_ref().to_string();
-        let output_pipes = to_pipes.iter().map(|p| p.as_ref().to_string()).collect();
+        let output_pipe = to_pipe.as_ref().to_string();
         let err_pipe = input_pipe.clone();
 
         self.iter_fns.push(IterStage {
             stage_type: IterStageType::Flatten,
             caster: Box::new(move |value: BoxedAnySend| {
-                value
-                    .downcast::<It>()
-                    .unwrap_or_else(|_| {
-                        panic!(
-                            "failed to downcast input value to {} from pipe '{}'",
-                            type_name::<It>(),
-                            err_pipe
-                        )
-                    })
+                downcast_from_pipe::<It>(value, &err_pipe)
                     .into_iter()
                     .map(|v| Box::new(v) as BoxedAnySend)
                     .collect()
             }),
             pipes: TaskPipeNames {
                 reader: input_pipe,
-                writers: output_pipes,
+                writers: vec![output_pipe],
             },
         });
         self
@@ -901,6 +880,16 @@ async fn write_results<O>(writers: &[PipeWriter<O>], results: Vec<Option<O>>) {
             writer.write(result).await;
         }
     }
+}
+
+fn downcast_from_pipe<T: 'static>(value: BoxedAnySend, pipe_name: &str) -> Box<T> {
+    value.downcast::<T>().unwrap_or_else(|_| {
+        panic!(
+            "failed to downcast input value to {} from pipe '{}'",
+            type_name::<T>(),
+            pipe_name,
+        )
+    })
 }
 
 fn check_join_result<T>(result: Result<T, JoinError>) {

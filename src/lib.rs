@@ -61,6 +61,10 @@
 //! * [PipelineBuilder::with_stage]
 //! * [PipelineBuilder::with_branching_stage]
 //!
+//! ### Utility
+//! This is an intermediate stage in the pipeline that can be used to do common operations on data between pipes.
+//! * [PipelineBuilder::with_flattener]
+//!
 //! # Stage Variants
 //!
 //! ### Branching (1 input, N outputs)
