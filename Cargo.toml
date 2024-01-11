@@ -1,6 +1,6 @@
 [package]
 name = "async-pipes"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Jake Biewer <biewers2@gmail.com>"]
 edition = "2021"
 rust-version = "1.63.0" # According to `$ cargo msrv`
@@ -17,5 +17,4 @@ tokio = { version = "1", features = ["rt", "macros", "sync"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread"] }
-tokio-test = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::sync::Synchronizer;
+use crate::pipeline::sync::Synchronizer;
 
 pub struct Consumed {
     id: String,
@@ -36,13 +36,10 @@ impl<T> PipeReader<T> {
         }
     }
 
-    /// Provides a callback function to be called once the task has handled a provided
-    /// input from this reader.
-    ///
-    /// This callback function decrements the task count for this pipe.
-    ///
-    /// We use a callback function here so it can be passed and called in the task definition
-    /// without having to give ownership of this reader to the task definition.
+    #[allow(dead_code)]
+    pub fn get_pipe_id(&self) -> &str {
+        &self.pipe_id
+    }
 
     /// Receive the next value from the inner receiver.
     pub async fn read(&mut self) -> Option<(T, Consumed)> {
@@ -90,6 +87,11 @@ impl<T> PipeWriter<T> {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn get_pipe_id(&self) -> &str {
+        &self.pipe_id
+    }
+
     /// Increment the task count for this pipe and then send the value through the channel.
     pub async fn write(&self, value: T) {
         self.synchronizer.started(&self.pipe_id);
@@ -104,10 +106,9 @@ impl<T> PipeWriter<T> {
 mod tests {
     use std::sync::Arc;
 
-    use crate::io::PipeReader;
     use tokio::sync::mpsc::channel;
 
-    use crate::sync::Synchronizer;
+    use super::*;
 
     #[tokio::test]
     async fn test_read_consumed_updates_sync_on_drop() {

@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering::{Acquire, Release, SeqCst};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 
-use async_pipes::{BoxedAnySend, Pipeline};
+use async_pipes::{branch, branch_inputs, NoOutput, Pipeline};
 
 #[tokio::test]
 async fn pipeline_returns_error_on_no_producer() {
@@ -116,10 +116,10 @@ async fn cyclic_pipeline() {
     Pipeline::builder()
         .with_inputs("one", vec![0usize])
         .with_stage("one", "two", move |value: usize| {
-            let tfp = task_first_passed.clone();
+            let first_passed = task_first_passed.clone();
 
             async move {
-                if !tfp.load(Acquire) {
+                if !first_passed.load(Acquire) {
                     assert_eq!(value, 0);
                 } else {
                     assert_eq!(value, 2);
@@ -128,24 +128,21 @@ async fn cyclic_pipeline() {
             }
         })
         .with_branching_stage("two", vec!["one", "three"], move |value: usize| {
-            let fp = first_passed.clone();
-
+            let first_passed = first_passed.clone();
             async move {
-                let values: Vec<Option<BoxedAnySend>> = if !fp.load(Acquire) {
-                    fp.store(true, Release);
+                let result = if !first_passed.load(Acquire) {
+                    first_passed.store(true, Release);
                     assert_eq!(value, 1);
-                    vec![Some(Box::new(value + 1)), None]
+                    branch![value + 1, NoOutput]
                 } else {
                     assert_eq!(value, 3);
-                    vec![None, Some(Box::new(value + 1))]
+                    branch![NoOutput, value + 1]
                 };
-
-                Some(values)
+                Some(result)
             }
         })
         .with_consumer("three", move |value: usize| {
             let tw = task_written.clone();
-
             async move {
                 assert_eq!(value, 4);
                 tw.store(true, Release);
@@ -177,7 +174,7 @@ async fn branching_pipeline() {
     Pipeline::builder()
         .with_branching_inputs(
             vec!["one-a", "one-b", "one-c"],
-            vec![vec![Box::new(1usize), Box::new(1usize), Box::new(1usize)]],
+            branch_inputs![(1usize, 1usize, 1usize)],
         )
         .with_stage("one-a", "two", |value: usize| async move {
             assert_eq!(value, 1);
@@ -192,10 +189,9 @@ async fn branching_pipeline() {
             Some(value + 1)
         })
         .with_consumer("two", move |value: usize| {
-            let tt = task_total.clone();
-
+            let total = task_total.clone();
             async move {
-                tt.fetch_add(value, SeqCst);
+                total.fetch_add(value, SeqCst);
             }
         })
         .build()
