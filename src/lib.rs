@@ -272,8 +272,6 @@
 //!
 #![warn(missing_docs)]
 
-extern crate core;
-
 pub use pipeline::*;
 
 mod pipeline;
