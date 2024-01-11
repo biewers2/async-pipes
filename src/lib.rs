@@ -45,8 +45,12 @@
 //! async fn main() {
 //!     let pipeline: Result<Pipeline, String> = Pipeline::builder()
 //!         .with_inputs("InputPipe", vec![1, 2, 3])
-//!         .with_stage("InputPipe", "OutputPipe", |n: i32| async move { Some(n + 1) })
-//!         .with_consumer("OutputPipe", |n: i32| async move { println!("{}", n) })
+//!         .with_stage("InputPipe", "OutputPipe", |n: i32| async move {
+//!             Some(n + 1)
+//!         })
+//!         .with_consumer("OutputPipe", |n: i32| async move {
+//!             println!("{}", n)
+//!         })
 //!         .build();
 //!
 //!     assert!(pipeline.is_ok());
@@ -69,7 +73,9 @@
 //! #[tokio::main]
 //! async fn main() {
 //!     let pipeline = Pipeline::builder()
-//!         .with_consumer("MyPipe", |n: usize| async move { println!("{}", n); })
+//!         .with_consumer("MyPipe", |n: usize| async move {
+//!             println!("{}", n);
+//!         })
 //!         .build();
 //!
 //!     assert_eq!(pipeline.unwrap_err(), "pipeline must have at least one producer");
@@ -105,8 +111,12 @@
 //! async fn main() -> Result<(), String> {
 //!     Pipeline::builder()
 //!         .with_inputs("InputPipe", vec![1, 2, 3])
-//!         .with_stage("InputPipe", "OutputPipe", |n: i32| async move { Some(n + 1) })
-//!         .with_consumer("OutputPipe", |n: i32| async move { println!("{}", n) })
+//!         .with_stage("InputPipe", "OutputPipe", |n: i32| async move {
+//!             Some(n + 1)
+//!         })
+//!         .with_consumer("OutputPipe", |n: i32| async move {
+//!             println!("{}", n)
+//!         })
 //!         .build()?
 //!         .wait()
 //!         .await;
@@ -212,8 +222,10 @@
 //! # Examples
 //!
 //! ```
-//! use async_pipes::Pipeline;
 //! use std::sync::Arc;
+//!
+//! use async_pipes::Pipeline;
+//!
 //! use std::sync::atomic::{AtomicUsize, Ordering};
 //! use tokio::sync::Mutex;
 //!
@@ -260,31 +272,140 @@
 //!
 #![warn(missing_docs)]
 
-use std::fmt::{Debug, Display, Formatter};
+extern crate core;
 
 pub use pipeline::*;
 
-mod io;
 mod pipeline;
-mod sync;
 
-/// Signals sent to stage workers.
+/// A value used in coordination with [branch] to indicate there is no value to be sent to a
+/// pipe.
 ///
-/// Useful for interrupting the natural workflow to tell it something.
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
-enum StageWorkerSignal {
-    /// Used to tell stage workers to finish immediately without waiting for remaining tasks to end.
-    Terminate,
+/// # Examples
+///
+/// ```
+/// use async_pipes::{NoOutput, BoxedAnySend, branch};
+///
+/// let outputs: Vec<Option<BoxedAnySend>> = branch![
+///     "one",
+///     NoOutput,
+///     3,
+/// ];
+///
+/// assert!(outputs[0].is_some());
+/// assert!(outputs[1].is_none());
+/// assert!(outputs[2].is_some());
+/// ```
+#[derive(Debug, Clone, Hash, Ord, PartialOrd, Eq, PartialEq)]
+pub struct NoOutput;
+
+/// Defines an idiomatic way to provide values to a static branching producer stage (i.e. concrete
+/// input values).
+///
+/// A list of tuples of values (of possibly different types) can be provided, and those values will be boxed
+/// and then put into a [Vec].
+///
+/// # Examples
+///
+/// Here's an example of what is returned by the macro call.
+/// ```
+/// use async_pipes::{BoxedAnySend, branch_inputs};
+///
+/// let inputs: Vec<Vec<BoxedAnySend>> = branch_inputs![
+///     (1usize, 1i32, 1u8),
+///     (2usize, 2i32, 2u8),
+///     (3usize, 3i32, 3u8),
+/// ];
+///
+/// assert_eq!(inputs.len(), 3);
+/// ```
+///
+/// Here's an example of the macro being used in a pipeline.
+/// ```
+/// use async_pipes::{branch_inputs, Pipeline};
+///
+/// #[tokio::main]
+/// async fn main() {
+///     Pipeline::builder()
+///         .with_branching_inputs(
+///             vec!["One", "Two"],
+///             branch_inputs![
+///                 (1usize, "Hello"),
+///                 (1usize, "World"),
+///                 (1usize, "!"),
+///             ],
+///         )
+///         .with_consumer("One", |value: usize| async move { /* ... */ })
+///         .with_consumer("Two", |value: &'static str| async move { /* ... */ })
+///         .build()
+///         .unwrap()
+///         .wait()
+///         .await;
+/// }
+/// ```
+#[macro_export]
+macro_rules! branch_inputs {
+    ($(( $($x:expr),+ $(,)? )),* $(,)?) => {
+        vec![
+            $( branch_inputs!($($x),+) ),*
+        ]
+    };
+
+    ($($x:expr),+ $(,)?) => {
+        vec![
+            $(std::boxed::Box::new($x) as $crate::BoxedAnySend),+
+        ]
+    };
 }
 
-impl Display for StageWorkerSignal {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Self::Terminate => "SIGTERM",
-            }
-        )
-    }
+/// Defines an idiomatic way to return values in a branching stage.
+///
+/// A list of values (possibly of different types) can be provided. These values will be boxed and
+/// then wrapped in a [Some]. In order to specify [None] (i.e. no value should be sent to the
+/// respective pipe), [NoOutput] should be used in the place of a value. The macro will detect this
+/// and use [None] in its place.
+///
+/// # Examples
+///
+/// Here's an example of what is returned by the macro call.
+/// ```
+/// use async_pipes::{BoxedAnySend, NoOutput, branch};
+///
+/// let inputs: Vec<Option<BoxedAnySend>> = branch![1, "hello", true, NoOutput, 12.0];
+///
+/// assert_eq!(inputs.len(), 5);
+/// assert!(inputs[3].is_none())
+/// ```
+///
+/// Here's an example of the macro being used in a pipeline.
+/// ```
+/// use async_pipes::{branch, branch_inputs, Pipeline};
+/// use std::sync::atomic::{AtomicUsize, Ordering};
+/// use std::sync::Arc;
+///
+/// #[tokio::main]
+/// async fn main() {
+///     Pipeline::builder()
+///         .with_inputs("Count", vec![1, 2, 3])
+///         .with_branching_stage("Count", vec!["Value", "Doubled"], |value: i32| async move {
+///             Some(branch![value, value * 2])
+///         })
+///         .with_consumer("Value", |value: i32| async move { /* ... */ })
+///         .with_consumer("Doubled", |value: i32| async move { /* ... */ })
+///         .build()
+///         .unwrap()
+///         .wait()
+///         .await;
+/// }
+/// ```
+#[macro_export]
+macro_rules! branch {
+    ($($x:expr),+ $(,)?) => {
+        std::vec![
+            $({
+                let x: $crate::BoxedAnySend = std::boxed::Box::new($x);
+                x.downcast_ref::<$crate::NoOutput>().is_none().then_some(x)
+            }),+
+        ]
+    };
 }

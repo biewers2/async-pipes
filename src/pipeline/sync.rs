@@ -57,7 +57,7 @@ mod tests {
 
     use tokio::join;
 
-    use crate::sync::Synchronizer;
+    use super::*;
 
     #[test]
     fn test_add_creates_entry() {
