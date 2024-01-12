@@ -18,6 +18,47 @@ use sync::Synchronizer;
 mod builder;
 mod io;
 mod sync;
+mod workers;
+
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+pub enum WorkerOpts {
+    SingleTask(SingleTaskWorkerOpts),
+    MultiTask(MultiTaskWorkerOpts),
+}
+
+#[derive(Debug, Default, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+pub struct SingleTaskWorkerOpts {}
+
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+pub struct MultiTaskWorkerOpts {
+    max_task_count: usize,
+}
+
+impl Default for WorkerOpts {
+    fn default() -> Self {
+        MultiTaskWorkerOpts::default().into()
+    }
+}
+
+impl Default for MultiTaskWorkerOpts {
+    fn default() -> Self {
+        Self {
+            max_task_count: 100,
+        }
+    }
+}
+
+impl From<SingleTaskWorkerOpts> for WorkerOpts {
+    fn from(value: SingleTaskWorkerOpts) -> Self {
+        Self::SingleTask(value)
+    }
+}
+
+impl From<MultiTaskWorkerOpts> for WorkerOpts {
+    fn from(value: MultiTaskWorkerOpts) -> Self {
+        Self::MultiTask(value)
+    }
+}
 
 /// A Box that can hold any value that is [Send].
 ///
@@ -65,21 +106,28 @@ pub type BoxedAnySend = Box<dyn Any + Send + 'static>;
 type ProducerFn = Box<dyn FnMut() -> TaskFuture + Send + 'static>;
 type TaskFn = Box<dyn Fn(BoxedAnySend) -> TaskFuture + Send + Sync + 'static>;
 type IterCastFn = Box<dyn Fn(BoxedAnySend) -> Vec<BoxedAnySend> + Send + Sync + 'static>;
-
 type TaskFuture = Pin<Box<dyn Future<Output = Option<Vec<Option<BoxedAnySend>>>> + Send + 'static>>;
 
-struct ProducerStage {
-    function: ProducerFn,
-    pipes: ProducerPipeNames,
+enum Stage {
+    Producer {
+        function: ProducerFn,
+        pipes: ProducerPipeNames,
+    },
+
+    Regular {
+        function: TaskFn,
+        pipes: TaskPipeNames,
+    },
+
+    Iterator {
+        stage_type: IterStageType,
+        caster: IterCastFn,
+        pipes: TaskPipeNames,
+    },
 }
 
 struct ProducerPipeNames {
     writers: Vec<String>,
-}
-
-struct TaskStage {
-    function: TaskFn,
-    pipes: TaskPipeNames,
 }
 
 struct TaskPipeNames {
@@ -87,27 +135,15 @@ struct TaskPipeNames {
     writers: Vec<String>,
 }
 
-struct IterStage {
-    stage_type: IterStageType,
-    caster: IterCastFn,
-    pipes: TaskPipeNames,
-}
-
 enum IterStageType {
     Flatten,
 }
 
 struct Pipe<T> {
-    writer: PipeWriter<T>,
     /// Use an option here to "take" it when a reader is used.
     /// Only allow one reader per pipe.
     reader: Option<PipeReader<T>>,
-}
-
-enum Stage {
-    Producer(ProducerStage),
-    Regular(TaskStage),
-    Iterator(IterStage),
+    writer: PipeWriter<T>,
 }
 
 /// Signals sent to stage workers.
