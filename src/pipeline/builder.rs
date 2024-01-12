@@ -355,7 +355,7 @@ impl PipelineBuilder {
                 reader: input_pipe,
                 writers: vec![output_pipe],
             },
-            options: Default::default(),
+            options: WorkerOptions::default_single_task(),
         });
         self
     }
@@ -413,7 +413,7 @@ impl PipelineBuilder {
     /// 2. The reader of a pipe was used more than once.
     ///
     pub fn build(self) -> Result<Pipeline, String> {
-        let configs = self.create_pipe_configs();
+        let configs = self.create_pipe_configs()?;
 
         // Register pipes in the synchronizer
         let mut synchronizer = Synchronizer::default();
@@ -473,7 +473,11 @@ impl PipelineBuilder {
                 } => {
                     let (reader, writers, signal_rx) = worker_args(pipes, &mut pipes_map)?;
                     workers.spawn(new_detached_worker(
-                        function, reader, writers, signal_rx, options,
+                        function,
+                        reader,
+                        writers,
+                        signal_rx,
+                        options.try_into()?,
                     ));
                 }
 
@@ -485,9 +489,13 @@ impl PipelineBuilder {
                 } => {
                     let (reader, writers, signal_rx) = worker_args(pipes, &mut pipes_map)?;
                     workers.spawn(match stage_type {
-                        IterStageType::Flatten => {
-                            new_detached_flattener(caster, reader, writers, signal_rx, options)
-                        }
+                        IterStageType::Flatten => new_detached_flattener(
+                            caster,
+                            reader,
+                            writers,
+                            signal_rx,
+                            options.try_into()?,
+                        ),
                     });
                 }
             }
@@ -511,21 +519,25 @@ impl PipelineBuilder {
     ///
     /// For each pipe, there is only one reader, but there can be multiple writers.
     /// Also, producers do not have a reader, only writers.
-    fn create_pipe_configs(&self) -> Vec<PipeConfig> {
-        self.stages
-            .iter()
-            .filter_map(|stage| match stage {
+    fn create_pipe_configs(&self) -> Result<Vec<PipeConfig>, String> {
+        let mut configs = Vec::new();
+        for stage in &self.stages {
+            match stage {
                 Stage::Regular { pipes, options, .. } | Stage::Iterator { pipes, options, .. } => {
-                    Some(PipeConfig {
+                    configs.push(PipeConfig {
                         name: pipes.reader.clone(),
-                        options: options.clone(),
-                    })
+                        options: options.clone().try_into()?,
+                    });
                 }
 
-                _ => None,
-            })
+                _ => {}
+            }
+        }
+
+        Ok(configs
+            .into_iter()
             .unique_by(|conf| conf.name.clone())
-            .collect()
+            .collect())
     }
 
     /// Register all the pipe configurations to the synchronizer.
@@ -548,7 +560,8 @@ impl PipelineBuilder {
         configs
             .into_iter()
             .map(|conf| {
-                let (tx, rx) = tokio::sync::mpsc::channel(conf.options.reader_buffer_size());
+                let buf_size = conf.options.reader_buffer_size.get();
+                let (tx, rx) = tokio::sync::mpsc::channel(buf_size);
                 let pipe = Pipe {
                     writer: PipeWriter::new(&conf.name, sync.clone(), tx),
                     reader: Some(PipeReader::new(&conf.name, sync.clone(), rx)),
