@@ -20,18 +20,24 @@ mod io;
 mod sync;
 mod workers;
 
+const DEFAULT_MAX_TASK_COUNT: usize = 100;
+const DEFAULT_READER_BUFFER_SIZE: usize = 32;
+
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub enum WorkerOpts {
     SingleTask(SingleTaskWorkerOpts),
     MultiTask(MultiTaskWorkerOpts),
 }
 
-#[derive(Debug, Default, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
-pub struct SingleTaskWorkerOpts {}
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+pub struct SingleTaskWorkerOpts {
+    reader_buffer_size: usize,
+}
 
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct MultiTaskWorkerOpts {
     max_task_count: usize,
+    reader_buffer_size: usize,
 }
 
 impl Default for WorkerOpts {
@@ -40,10 +46,19 @@ impl Default for WorkerOpts {
     }
 }
 
+impl Default for SingleTaskWorkerOpts {
+    fn default() -> Self {
+        Self {
+            reader_buffer_size: DEFAULT_READER_BUFFER_SIZE,
+        }
+    }
+}
+
 impl Default for MultiTaskWorkerOpts {
     fn default() -> Self {
         Self {
-            max_task_count: 100,
+            max_task_count: DEFAULT_MAX_TASK_COUNT,
+            reader_buffer_size: DEFAULT_READER_BUFFER_SIZE,
         }
     }
 }
@@ -57,6 +72,34 @@ impl From<SingleTaskWorkerOpts> for WorkerOpts {
 impl From<MultiTaskWorkerOpts> for WorkerOpts {
     fn from(value: MultiTaskWorkerOpts) -> Self {
         Self::MultiTask(value)
+    }
+}
+
+impl WorkerOpts {
+    pub(crate) fn reader_buffer_size(&self) -> usize {
+        match self {
+            WorkerOpts::SingleTask(SingleTaskWorkerOpts {
+                reader_buffer_size, ..
+            }) => *reader_buffer_size,
+            WorkerOpts::MultiTask(MultiTaskWorkerOpts {
+                reader_buffer_size, ..
+            }) => *reader_buffer_size,
+        }
+    }
+
+    pub(crate) fn into_single_task_worker_options(self) -> SingleTaskWorkerOpts {
+        match self {
+            WorkerOpts::SingleTask(options) => options,
+            _ => Default::default(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn into_multi_task_worker_options(self) -> MultiTaskWorkerOpts {
+        match self {
+            WorkerOpts::MultiTask(options) => options,
+            _ => Default::default(),
+        }
     }
 }
 
@@ -117,28 +160,40 @@ enum Stage {
     Regular {
         function: TaskFn,
         pipes: TaskPipeNames,
+        options: WorkerOpts,
     },
 
     Iterator {
         stage_type: IterStageType,
         caster: IterCastFn,
         pipes: TaskPipeNames,
+        options: WorkerOpts,
     },
 }
 
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 struct ProducerPipeNames {
     writers: Vec<String>,
 }
 
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 struct TaskPipeNames {
     reader: String,
     writers: Vec<String>,
 }
 
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 enum IterStageType {
     Flatten,
 }
 
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+struct PipeConfig {
+    name: String,
+    options: WorkerOpts,
+}
+
+#[derive(Debug)]
 struct Pipe<T> {
     /// Use an option here to "take" it when a reader is used.
     /// Only allow one reader per pipe.
@@ -158,7 +213,7 @@ enum StageWorkerSignal {
 impl Display for StageWorkerSignal {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let signal = match self {
-            Self::Terminate => "SIGTERM",
+            Self::Terminate => "Terminate",
         };
         write!(f, "{signal}")
     }

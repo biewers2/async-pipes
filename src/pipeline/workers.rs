@@ -73,12 +73,13 @@ pub async fn new_detached_flattener(
     reader: PipeReader<BoxedAnySend>,
     writers: Vec<PipeWriter<BoxedAnySend>>,
     signal_rx: Receiver<StageWorkerSignal>,
+    options: WorkerOpts,
 ) {
     new_detached_single_task_worker(
         reader,
         writers,
         signal_rx,
-        Default::default(),
+        options.into_single_task_worker_options(),
         move |value, writers| {
             let values = caster(value);
             async move {
@@ -125,19 +126,19 @@ async fn new_detached_multi_task_worker<F, Fut>(
     writers: Vec<PipeWriter<BoxedAnySend>>,
     mut signal_rx: Receiver<StageWorkerSignal>,
     options: MultiTaskWorkerOpts,
-    new_task: F,
+    task: F,
 ) where
     F: Fn(BoxedAnySend, Vec<PipeWriter<BoxedAnySend>>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    let MultiTaskWorkerOpts { max_task_count } = &options;
+    let MultiTaskWorkerOpts { max_task_count, .. } = &options;
 
     let mut tasks = JoinSet::new();
     loop {
         select! {
             Some((value, consumed)) = reader.read(), if tasks.len() < *max_task_count => {
                 let writers = writers.clone();
-                let task = new_task(value, writers);
+                let task = task(value, writers);
 
                 tasks.spawn(async move {
                     // Take ownership in order to drop it once task ends

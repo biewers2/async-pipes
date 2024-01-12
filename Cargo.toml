@@ -15,6 +15,7 @@ categories = ["asynchronous", "concurrency"]
 [dependencies]
 tokio = { version = "1", features = ["rt", "macros", "sync"] }
 uuid = { version = "1", features = ["v4"] }
+itertools = "0.12"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }

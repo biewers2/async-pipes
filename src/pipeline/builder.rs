@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use tokio::sync::mpsc::channel;
+use itertools::Itertools;
 use tokio::task::JoinSet;
 
 use crate::pipeline::io::*;
@@ -11,6 +11,12 @@ use crate::pipeline::workers::{
     new_detached_flattener, new_detached_producer, new_detached_worker,
 };
 use crate::pipeline::*;
+
+struct CreateWorkersOutput {
+    producers: JoinSet<()>,
+    workers: JoinSet<()>,
+    signal_txs: Vec<Sender<StageWorkerSignal>>,
+}
 
 /// Used to construct a [Pipeline].
 ///
@@ -268,6 +274,7 @@ impl PipelineBuilder {
                 reader: input_pipe,
                 writers: output_pipes,
             },
+            options: Default::default(),
         });
         self
     }
@@ -348,6 +355,7 @@ impl PipelineBuilder {
                 reader: input_pipe,
                 writers: vec![output_pipe],
             },
+            options: Default::default(),
         });
         self
     }
@@ -405,14 +413,35 @@ impl PipelineBuilder {
     /// 2. The reader of a pipe was used more than once.
     ///
     pub fn build(self) -> Result<Pipeline, String> {
-        // Create pipe IDs and register them in the synchronizer
+        let configs = self.create_pipe_configs();
+
+        // Register pipes in the synchronizer
         let mut synchronizer = Synchronizer::default();
-        let names = self.register_names(&mut synchronizer);
+        self.register_pipe_configs(&mut synchronizer, &configs);
 
         // Make the synchronizer immutable and the create the actual pipes
         let synchronizer = Arc::new(synchronizer);
-        let mut pipes_map = self.create_pipes(&synchronizer, names);
+        let pipes_map = self.create_pipes(&synchronizer, configs);
 
+        let CreateWorkersOutput {
+            producers,
+            workers,
+            signal_txs,
+        } = self.create_workers(pipes_map)?;
+
+        Ok(Pipeline {
+            synchronizer,
+            producers,
+            workers,
+            signal_txs,
+        })
+    }
+
+    /// Create the producers, workers, and the associated signal channels.
+    fn create_workers(
+        self,
+        mut pipes_map: HashMap<String, Pipe<BoxedAnySend>>,
+    ) -> Result<CreateWorkersOutput, String> {
         let mut producers = JoinSet::new();
         let mut workers = JoinSet::new();
         let mut signal_txs = Vec::new();
@@ -422,7 +451,7 @@ impl PipelineBuilder {
                 let writers = find_writers(&pipe_names.writers, pipes)?;
                 let reader = find_reader(&pipe_names.reader, pipes)?;
 
-                let (signal_tx, signal_rx) = channel(1);
+                let (signal_tx, signal_rx) = tokio::sync::mpsc::channel(1);
                 signal_txs.push(signal_tx);
 
                 Result::<_, String>::Ok((reader, writers, signal_rx))
@@ -437,14 +466,14 @@ impl PipelineBuilder {
                     producers.spawn(new_detached_producer(function, writers));
                 }
 
-                Stage::Regular { function, pipes } => {
+                Stage::Regular {
+                    function,
+                    pipes,
+                    options,
+                } => {
                     let (reader, writers, signal_rx) = worker_args(pipes, &mut pipes_map)?;
                     workers.spawn(new_detached_worker(
-                        function,
-                        reader,
-                        writers,
-                        signal_rx,
-                        Default::default(),
+                        function, reader, writers, signal_rx, options,
                     ));
                 }
 
@@ -452,11 +481,12 @@ impl PipelineBuilder {
                     stage_type,
                     caster,
                     pipes,
+                    options,
                 } => {
                     let (reader, writers, signal_rx) = worker_args(pipes, &mut pipes_map)?;
                     workers.spawn(match stage_type {
                         IterStageType::Flatten => {
-                            new_detached_flattener(caster, reader, writers, signal_rx)
+                            new_detached_flattener(caster, reader, writers, signal_rx, options)
                         }
                     });
                 }
@@ -467,45 +497,45 @@ impl PipelineBuilder {
             return Err("pipeline must have at least one producer".to_string());
         }
 
-        Ok(Pipeline {
-            synchronizer,
+        Ok(CreateWorkersOutput {
             producers,
             workers,
             signal_txs,
         })
     }
 
-    /// Register all the pipe names to the synchronizer.
-    ///
-    /// This is done before creating the pipes as the synchronizer only needs to be mutable
-    /// for this step, afterwards it can be considered "immutable".
-    fn register_names(&self, sync: &mut Synchronizer) -> Vec<String> {
-        let names = self.names();
-        for name in &names {
-            sync.register(name);
-        }
-        names
-    }
-
-    /// Collect the names of all the pipes.
+    /// Construct the configuration of all the pipes.
     ///
     /// We can achieve a set of unique names easily by using the `reader` of the "task" and "iter"
     /// stages and de-duplicating that list.
     ///
     /// For each pipe, there is only one reader, but there can be multiple writers.
     /// Also, producers do not have a reader, only writers.
-    fn names(&self) -> Vec<String> {
-        let mut names = HashSet::new();
-        for stage in &self.stages {
-            if let Some(name) = match stage {
-                Stage::Regular { pipes, .. } => Some(pipes.reader.clone()),
-                Stage::Iterator { pipes, .. } => Some(pipes.reader.clone()),
+    fn create_pipe_configs(&self) -> Vec<PipeConfig> {
+        self.stages
+            .iter()
+            .filter_map(|stage| match stage {
+                Stage::Regular { pipes, options, .. } | Stage::Iterator { pipes, options, .. } => {
+                    Some(PipeConfig {
+                        name: pipes.reader.clone(),
+                        options: options.clone(),
+                    })
+                }
+
                 _ => None,
-            } {
-                names.insert(name);
-            }
+            })
+            .unique_by(|conf| conf.name.clone())
+            .collect()
+    }
+
+    /// Register all the pipe configurations to the synchronizer.
+    ///
+    /// This is done before creating the pipes as the synchronizer only needs to be mutable
+    /// for this step, afterwards it can be considered "immutable".
+    fn register_pipe_configs(&self, sync: &mut Synchronizer, pipe_configs: &[PipeConfig]) {
+        for conf in pipe_configs {
+            sync.register(&conf.name);
         }
-        names.into_iter().collect()
     }
 
     /// The reader of a pipe is wrapped in an option to allow the build method to [Option::take] it
@@ -513,17 +543,18 @@ impl PipelineBuilder {
     fn create_pipes(
         &self,
         sync: &Arc<Synchronizer>,
-        names: Vec<String>,
+        configs: Vec<PipeConfig>,
     ) -> HashMap<String, Pipe<BoxedAnySend>> {
-        let mut pipes = HashMap::new();
-        for name in names {
-            let (tx, rx) = channel(100);
-            let pipe = Pipe {
-                writer: PipeWriter::new(&name, sync.clone(), tx),
-                reader: Some(PipeReader::new(&name, sync.clone(), rx)),
-            };
-            pipes.insert(name, pipe);
-        }
-        pipes
+        configs
+            .into_iter()
+            .map(|conf| {
+                let (tx, rx) = tokio::sync::mpsc::channel(conf.options.reader_buffer_size());
+                let pipe = Pipe {
+                    writer: PipeWriter::new(&conf.name, sync.clone(), tx),
+                    reader: Some(PipeReader::new(&conf.name, sync.clone(), rx)),
+                };
+                (conf.name, pipe)
+            })
+            .collect()
     }
 }
