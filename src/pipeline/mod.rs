@@ -612,14 +612,6 @@ mod tests {
         downcast_from_pipe::<i32>(value, "some_pipe");
     }
 
-    // fn check_join_result<T>(result: Result<T, JoinError>) {
-    //     if let Err(e) = result {
-    //         if e.is_panic() {
-    //             panic::resume_unwind(e.into_panic())
-    //         }
-    //     }
-    // }
-
     #[test]
     fn test_check_join_result_does_nothing_on_ok() {
         check_join_result(Ok(3usize));
