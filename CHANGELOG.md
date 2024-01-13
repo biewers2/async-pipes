@@ -1,8 +1,9 @@
 ## 0.3.0 (Jan 13, 2024)
 **Feature(s):**
-* **!! BREAKING !!** - Add `WorkerOptions` struct, passable to each non-producer stage.
+* Add `WorkerOptions` struct
   * Allows specification of max. number of tasks a worker can have and the max. size of a buffer in
     a pipe.
+* **!! BREAKING !!** - Add parameter to each non-producer stage to pass in worker options.
   * To resolve the breaking change, for each non-producer stage defined, add in
     `WorkerOptions::default()` before the task definition/closure.
 

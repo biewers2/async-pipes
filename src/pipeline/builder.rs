@@ -304,11 +304,11 @@ impl PipelineBuilder {
     /// use std::sync::Arc;
     /// use std::sync::atomic::{AtomicI32, Ordering};
     /// use async_pipes::Pipeline;
+    /// use async_pipes::WorkerOptions;
     ///
     /// #[tokio::main]
     /// async fn main() {
-    ///     use async_pipes::WorkerOptions;
-    /// let sum = Arc::new(AtomicI32::new(0));
+    ///     let sum = Arc::new(AtomicI32::new(0));
     ///     let task_sum = sum.clone();
     ///
     ///     Pipeline::builder()

@@ -441,3 +441,94 @@ macro_rules! branch {
         ]
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{NoOutput, Pipeline, WorkerOptions};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Use the code of this test for the `README`'s `Simple, Linear Pipeline Example`.
+    #[tokio::test]
+    async fn test_readme_simple_linear_pipeline() {
+        let total = Arc::new(AtomicUsize::new(0));
+        let task_total = total.clone();
+
+        Pipeline::builder()
+            .with_inputs("MapPipe", vec!["a", "bb", "ccc"])
+            .with_stage(
+                "MapPipe",
+                "ReducePipe",
+                WorkerOptions::default(),
+                |value: &'static str| async move { Some(format!("{}!", value)) },
+            )
+            .with_consumer(
+                "ReducePipe",
+                WorkerOptions::default_single_task(),
+                move |value: String| {
+                    let total = task_total.clone();
+                    async move {
+                        total.fetch_add(value.len(), Ordering::SeqCst);
+                    }
+                },
+            )
+            .build()
+            .expect("failed to build pipeline!")
+            .wait()
+            .await;
+
+        assert_eq!(total.load(Ordering::Acquire), 9);
+    }
+
+    /// Use the code of this test for the `README`'s `Branching, Cyclic Pipeline Example`.
+    #[tokio::test]
+    async fn test_readme_branching_cyclic_pipeline() {
+        let initial_urls = vec![
+            "https://example.com".to_string(),
+            "https://rust-lang.org".to_string(),
+        ];
+
+        Pipeline::builder()
+            .with_inputs("ToFetch", initial_urls)
+            .with_flattener::<Vec<String>>("ToFlattenThenFetch", "ToFetch")
+            .with_stage(
+                "ToFetch",
+                "ToCrawl",
+                WorkerOptions::default_multi_task(),
+                |_url: String| async move {
+                    // Fetch content from url...
+                    Some("<html>Sample Content</html>".to_string())
+                },
+            )
+            .with_branching_stage(
+                "ToCrawl",
+                vec!["ToFlattenThenFetch", "ToLog"],
+                WorkerOptions::default_single_task(),
+                |_html: String| async move {
+                    // Crawl HTML, extracting embedded URLs and content
+                    let has_embedded_urls = false; // Mimic the crawler not finding any URLs
+
+                    let output = if has_embedded_urls {
+                        let urls = vec![
+                            "https://first.com".to_string(),
+                            "https://second.com".to_string(),
+                        ];
+                        branch![urls, NoOutput]
+                    } else {
+                        branch![NoOutput, "Extracted content".to_string()]
+                    };
+
+                    Some(output)
+                },
+            )
+            .with_consumer(
+                "ToLog",
+                WorkerOptions::default_single_task(),
+                |content: String| async move { println!("{content}") },
+            )
+            .build()
+            .expect("failed to build pipeline!")
+            .wait()
+            .await;
+    }
+}

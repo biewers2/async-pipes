@@ -60,10 +60,7 @@ pub struct WorkerOptions {
 
 impl Default for WorkerOptions {
     fn default() -> Self {
-        Self {
-            max_task_count: DEFAULT_MAX_TASK_COUNT,
-            pipe_buffer_size: DEFAULT_READER_BUFFER_SIZE,
-        }
+        Self::default_multi_task()
     }
 }
 
@@ -73,6 +70,15 @@ impl WorkerOptions {
         Self {
             max_task_count: 1,
             ..Default::default()
+        }
+    }
+
+    /// Specifies `100` for [WorkerOptions::max_task_count] and `30` for
+    /// [WorkerOptions::pipe_buffer_size].
+    pub fn default_multi_task() -> Self {
+        Self {
+            max_task_count: DEFAULT_MAX_TASK_COUNT,
+            pipe_buffer_size: DEFAULT_READER_BUFFER_SIZE,
         }
     }
 }
