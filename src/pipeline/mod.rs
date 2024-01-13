@@ -581,6 +581,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_write_results() {
         let (writers, mut txs) = pipe_writers!(3, usize);
         let results = vec![Some(0), None, Some(2)];
@@ -594,6 +595,7 @@ mod tests {
 
     #[tokio::test]
     #[should_panic]
+    #[cfg_attr(miri, ignore)]
     async fn test_write_results_panics_on_result_count_mismatch() {
         let (writers, _txs) = pipe_writers!(5, i32);
         let results = vec![Some(1), None, None];
