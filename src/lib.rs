@@ -35,22 +35,32 @@
 //! ```
 //!
 //! Using the builder, stages can be defined, where a stage contains the name of a pipe to read from
-//! (if applicable), the name of a pipe to write to (or more if applicable), and a user-defined
-//! "task" function. Demonstrated below is a pipeline being built with a producer stage, a regular
-//! stage, and a consuming stage.
+//! (if applicable), the name of a pipe to write to (or more if applicable), some options for the
+//! worker, and a user-defined "task" function.
+//!
+//! For information on what worker options are available, see [WorkerOptions].
+//!
+//! Demonstrated below is a pipeline being built with a producer stage, a regular stage, and a
+//! consuming stage.
 //! ```
 //! use async_pipes::Pipeline;
+//! use async_pipes::WorkerOptions;
 //!
 //! #[tokio::main]
 //! async fn main() {
 //!     let pipeline: Result<Pipeline, String> = Pipeline::builder()
 //!         .with_inputs("InputPipe", vec![1, 2, 3])
-//!         .with_stage("InputPipe", "OutputPipe", |n: i32| async move {
-//!             Some(n + 1)
-//!         })
-//!         .with_consumer("OutputPipe", |n: i32| async move {
-//!             println!("{}", n)
-//!         })
+//!         .with_stage(
+//!             "InputPipe",
+//!             "OutputPipe",
+//!             WorkerOptions::default(),
+//!             |n: i32| async move { Some(n + 1) }
+//!         )
+//!         .with_consumer(
+//!             "OutputPipe",
+//!             WorkerOptions::default_single_task(),
+//!             |n: i32| async move { println!("{}", n) }
+//!         )
 //!         .build();
 //!
 //!     assert!(pipeline.is_ok());
@@ -69,11 +79,12 @@
 //! For example, here is an invalid pipeline due to requirement (1) not being followed:
 //! ```
 //! use async_pipes::Pipeline;
+//! use async_pipes::WorkerOptions;
 //!
 //! #[tokio::main]
 //! async fn main() {
 //!     let pipeline = Pipeline::builder()
-//!         .with_consumer("MyPipe", |n: usize| async move {
+//!         .with_consumer("MyPipe", WorkerOptions::default(), |n: usize| async move {
 //!             println!("{}", n);
 //!         })
 //!         .build();
@@ -106,15 +117,16 @@
 //!
 //! ```
 //! use async_pipes::Pipeline;
+//! use async_pipes::WorkerOptions;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), String> {
 //!     Pipeline::builder()
 //!         .with_inputs("InputPipe", vec![1, 2, 3])
-//!         .with_stage("InputPipe", "OutputPipe", |n: i32| async move {
+//!         .with_stage("InputPipe", "OutputPipe", WorkerOptions::default(), |n: i32| async move {
 //!             Some(n + 1)
 //!         })
-//!         .with_consumer("OutputPipe", |n: i32| async move {
+//!         .with_consumer("OutputPipe", WorkerOptions::default(), |n: i32| async move {
 //!             println!("{}", n)
 //!         })
 //!         .build()?
@@ -141,6 +153,7 @@
 //! use async_pipes::Pipeline;
 //! use std::sync::Arc;
 //! use tokio::sync::Mutex;
+//! use async_pipes::WorkerOptions;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), String> {
@@ -151,7 +164,7 @@
 //!
 //!     Pipeline::builder()
 //!         .with_inputs("InputPipe", vec![1, 2, 3])
-//!         .with_stage("InputPipe", "OutputPipe", move |n: i32| {
+//!         .with_stage("InputPipe", "OutputPipe", WorkerOptions::default(), move |n: i32| {
 //!             // As the sum is owned by this closure, we need to clone it to move an owned value
 //!             // into the `async move` block.
 //!             let sum = sum.clone();
@@ -161,7 +174,7 @@
 //!                 Some(*sum)
 //!             }
 //!         })
-//!         .with_consumer("OutputPipe", |n: i32| async move {
+//!         .with_consumer("OutputPipe", WorkerOptions::default(), |n: i32| async move {
 //!             println!("Counter now at: {}", n)
 //!         })
 //!         .build()?
@@ -228,6 +241,7 @@
 //!
 //! use std::sync::atomic::{AtomicUsize, Ordering};
 //! use tokio::sync::Mutex;
+//! use async_pipes::WorkerOptions;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), String> {
@@ -241,14 +255,19 @@
 //!         .with_inputs("MapPipe", vec!["a", "bb", "ccc"])
 //!
 //!         // Read from the 'MapPipe' and write to the 'ReducePipe'
-//!         .with_stage("MapPipe", "ReducePipe", |value: &'static str| async move {
-//!             // We return an option to tell the stage whether to write the new value
-//!             // to the pipe or ignore it
-//!             Some(format!("{}!", value))
-//!         })
+//!         .with_stage(
+//!             "MapPipe",
+//!             "ReducePipe",
+//!             WorkerOptions::default(),
+//!             |value: &'static str| async move {
+//!                 // We return an option to tell the stage whether to write the new value
+//!                 // to the pipe or ignore it
+//!                 Some(format!("{}!", value))
+//!             }
+//!         )
 //!
 //!         // Read from the 'ReducePipe'.
-//!         .with_consumer("ReducePipe", move |value: String| {
+//!         .with_consumer("ReducePipe", WorkerOptions::default(), move |value: String| {
 //!             // The captured `task_total_count` can't move out of this closure, so we
 //!             // have to clone it to give ownership to the async block. Remember, it's
 //!             // wrapped in an [Arc] so we're still referring to the original data.
@@ -321,6 +340,7 @@ pub struct NoOutput;
 /// Here's an example of the macro being used in a pipeline.
 /// ```
 /// use async_pipes::{branch_inputs, Pipeline};
+/// use async_pipes::WorkerOptions;
 ///
 /// #[tokio::main]
 /// async fn main() {
@@ -333,8 +353,12 @@ pub struct NoOutput;
 ///                 (1usize, "!"),
 ///             ],
 ///         )
-///         .with_consumer("One", |value: usize| async move { /* ... */ })
-///         .with_consumer("Two", |value: &'static str| async move { /* ... */ })
+///         .with_consumer("One", WorkerOptions::default(), |value: usize| async move {
+///             /* ... */
+///         })
+///         .with_consumer("Two", WorkerOptions::default(), |value: &'static str| async move {
+///             /* ... */
+///         })
 ///         .build()
 ///         .unwrap()
 ///         .wait()
@@ -380,16 +404,26 @@ macro_rules! branch_inputs {
 /// use async_pipes::{branch, branch_inputs, Pipeline};
 /// use std::sync::atomic::{AtomicUsize, Ordering};
 /// use std::sync::Arc;
+/// use async_pipes::WorkerOptions;
 ///
 /// #[tokio::main]
 /// async fn main() {
 ///     Pipeline::builder()
 ///         .with_inputs("Count", vec![1, 2, 3])
-///         .with_branching_stage("Count", vec!["Value", "Doubled"], |value: i32| async move {
-///             Some(branch![value, value * 2])
+///         .with_branching_stage(
+///             "Count",
+///             vec!["Value", "Doubled"],
+///             WorkerOptions::default(),
+///             |value: i32| async move {
+///                 Some(branch![value, value * 2])
+///             }
+///         )
+///         .with_consumer("Value", WorkerOptions::default(), |value: i32| async move {
+///             /* ... */
 ///         })
-///         .with_consumer("Value", |value: i32| async move { /* ... */ })
-///         .with_consumer("Doubled", |value: i32| async move { /* ... */ })
+///         .with_consumer("Doubled", WorkerOptions::default(), |value: i32| async move {
+///             /* ... */
+///         })
 ///         .build()
 ///         .unwrap()
 ///         .wait()

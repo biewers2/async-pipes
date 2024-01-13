@@ -2,13 +2,22 @@ use std::sync::atomic::Ordering::{Acquire, Release, SeqCst};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 
-use async_pipes::{branch, branch_inputs, NoOutput, Pipeline};
+use async_pipes::{branch, branch_inputs, NoOutput, Pipeline, WorkerOptions};
 
 #[tokio::test]
 async fn pipeline_returns_error_on_no_producer() {
     let error = Pipeline::builder()
-        .with_stage("one", "two", |_: ()| async move { Some(()) })
-        .with_consumer("two", |_: usize| async move {})
+        .with_stage(
+            "one",
+            "two",
+            WorkerOptions::default_single_task(),
+            |_: ()| async move { Some(()) },
+        )
+        .with_consumer(
+            "two",
+            WorkerOptions::default_single_task(),
+            |_: usize| async move {},
+        )
         .build()
         .unwrap_err();
 
@@ -19,7 +28,12 @@ async fn pipeline_returns_error_on_no_producer() {
 async fn pipeline_returns_error_on_open_ended_pipes() {
     let error = Pipeline::builder()
         .with_inputs("one", vec![()])
-        .with_stage("one", "two", |_: ()| async move { Some(()) })
+        .with_stage(
+            "one",
+            "two",
+            WorkerOptions::default_single_task(),
+            |_: ()| async move { Some(()) },
+        )
         .build()
         .unwrap_err();
 
@@ -40,13 +54,17 @@ async fn simple_linear_pipeline() {
 
     Pipeline::builder()
         .with_inputs("one", vec![5usize])
-        .with_consumer("one", move |value: usize| {
-            let tw = task_written.clone();
-            async move {
-                assert_eq!(value, 5);
-                tw.store(true, Release);
-            }
-        })
+        .with_consumer(
+            "one",
+            WorkerOptions::default_single_task(),
+            move |value: usize| {
+                let tw = task_written.clone();
+                async move {
+                    assert_eq!(value, 5);
+                    tw.store(true, Release);
+                }
+            },
+        )
         .build()
         .unwrap()
         .wait()
@@ -69,25 +87,44 @@ async fn complex_linear_pipeline() {
 
     Pipeline::builder()
         .with_inputs("one", vec![1usize])
-        .with_stage("one", "two", |value: usize| async move {
-            assert_eq!(value, 1);
-            Some(value + 1)
-        })
-        .with_stage("two", "three", |value: usize| async move {
-            assert_eq!(value, 2);
-            Some(value + 2)
-        })
-        .with_stage("three", "four", |value: usize| async move {
-            assert_eq!(value, 4);
-            Some(value + 3)
-        })
-        .with_consumer("four", move |value: usize| {
-            let tw = task_written.clone();
-            async move {
-                assert_eq!(value, 7);
-                tw.store(true, Release);
-            }
-        })
+        .with_stage(
+            "one",
+            "two",
+            WorkerOptions::default_single_task(),
+            |value: usize| async move {
+                assert_eq!(value, 1);
+                Some(value + 1)
+            },
+        )
+        .with_stage(
+            "two",
+            "three",
+            WorkerOptions::default_single_task(),
+            |value: usize| async move {
+                assert_eq!(value, 2);
+                Some(value + 2)
+            },
+        )
+        .with_stage(
+            "three",
+            "four",
+            WorkerOptions::default_single_task(),
+            |value: usize| async move {
+                assert_eq!(value, 4);
+                Some(value + 3)
+            },
+        )
+        .with_consumer(
+            "four",
+            WorkerOptions::default_single_task(),
+            move |value: usize| {
+                let tw = task_written.clone();
+                async move {
+                    assert_eq!(value, 7);
+                    tw.store(true, Release);
+                }
+            },
+        )
         .build()
         .unwrap()
         .wait()
@@ -115,39 +152,53 @@ async fn cyclic_pipeline() {
 
     Pipeline::builder()
         .with_inputs("one", vec![0usize])
-        .with_stage("one", "two", move |value: usize| {
-            let first_passed = task_first_passed.clone();
+        .with_stage(
+            "one",
+            "two",
+            WorkerOptions::default_single_task(),
+            move |value: usize| {
+                let first_passed = task_first_passed.clone();
 
-            async move {
-                if !first_passed.load(Acquire) {
-                    assert_eq!(value, 0);
-                } else {
-                    assert_eq!(value, 2);
+                async move {
+                    if !first_passed.load(Acquire) {
+                        assert_eq!(value, 0);
+                    } else {
+                        assert_eq!(value, 2);
+                    }
+                    Some(value + 1)
                 }
-                Some(value + 1)
-            }
-        })
-        .with_branching_stage("two", vec!["one", "three"], move |value: usize| {
-            let first_passed = first_passed.clone();
-            async move {
-                let result = if !first_passed.load(Acquire) {
-                    first_passed.store(true, Release);
-                    assert_eq!(value, 1);
-                    branch![value + 1, NoOutput]
-                } else {
-                    assert_eq!(value, 3);
-                    branch![NoOutput, value + 1]
-                };
-                Some(result)
-            }
-        })
-        .with_consumer("three", move |value: usize| {
-            let tw = task_written.clone();
-            async move {
-                assert_eq!(value, 4);
-                tw.store(true, Release);
-            }
-        })
+            },
+        )
+        .with_branching_stage(
+            "two",
+            vec!["one", "three"],
+            WorkerOptions::default_single_task(),
+            move |value: usize| {
+                let first_passed = first_passed.clone();
+                async move {
+                    let result = if !first_passed.load(Acquire) {
+                        first_passed.store(true, Release);
+                        assert_eq!(value, 1);
+                        branch![value + 1, NoOutput]
+                    } else {
+                        assert_eq!(value, 3);
+                        branch![NoOutput, value + 1]
+                    };
+                    Some(result)
+                }
+            },
+        )
+        .with_consumer(
+            "three",
+            WorkerOptions::default_single_task(),
+            move |value: usize| {
+                let tw = task_written.clone();
+                async move {
+                    assert_eq!(value, 4);
+                    tw.store(true, Release);
+                }
+            },
+        )
         .build()
         .unwrap()
         .wait()
@@ -176,24 +227,43 @@ async fn branching_pipeline() {
             vec!["one-a", "one-b", "one-c"],
             branch_inputs![(1usize, 1usize, 1usize)],
         )
-        .with_stage("one-a", "two", |value: usize| async move {
-            assert_eq!(value, 1);
-            Some(value + 1)
-        })
-        .with_stage("one-b", "two", |value: usize| async move {
-            assert_eq!(value, 1);
-            Some(value + 1)
-        })
-        .with_stage("one-c", "two", |value: usize| async move {
-            assert_eq!(value, 1);
-            Some(value + 1)
-        })
-        .with_consumer("two", move |value: usize| {
-            let total = task_total.clone();
-            async move {
-                total.fetch_add(value, SeqCst);
-            }
-        })
+        .with_stage(
+            "one-a",
+            "two",
+            WorkerOptions::default_single_task(),
+            |value: usize| async move {
+                assert_eq!(value, 1);
+                Some(value + 1)
+            },
+        )
+        .with_stage(
+            "one-b",
+            "two",
+            WorkerOptions::default_single_task(),
+            |value: usize| async move {
+                assert_eq!(value, 1);
+                Some(value + 1)
+            },
+        )
+        .with_stage(
+            "one-c",
+            "two",
+            WorkerOptions::default_single_task(),
+            |value: usize| async move {
+                assert_eq!(value, 1);
+                Some(value + 1)
+            },
+        )
+        .with_consumer(
+            "two",
+            WorkerOptions::default_single_task(),
+            move |value: usize| {
+                let total = task_total.clone();
+                async move {
+                    total.fetch_add(value, SeqCst);
+                }
+            },
+        )
         .build()
         .unwrap()
         .wait()

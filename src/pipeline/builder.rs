@@ -166,14 +166,14 @@ impl PipelineBuilder {
     ///
     /// This pipeline builder.
     ///
-    pub fn with_consumer<S, I, F, Fut>(self, pipe: S, task: F) -> Self
+    pub fn with_consumer<S, I, F, Fut>(self, pipe: S, options: WorkerOptions, task: F) -> Self
     where
         S: AsRef<str>,
         I: Send + 'static,
         F: Fn(I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.with_branching_stage(pipe, Vec::<String>::new(), move |value| {
+        self.with_branching_stage(pipe, Vec::<String>::new(), options, move |value| {
             let task_fut = task(value);
             async move {
                 task_fut.await;
@@ -203,6 +203,7 @@ impl PipelineBuilder {
         self,
         input_pipe: impl AsRef<str>,
         output_pipe: impl AsRef<str>,
+        options: WorkerOptions,
         task: F,
     ) -> Self
     where
@@ -211,7 +212,7 @@ impl PipelineBuilder {
         F: Fn(I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Option<O>> + Send + 'static,
     {
-        self.with_branching_stage(input_pipe, vec![output_pipe], move |value| {
+        self.with_branching_stage(input_pipe, vec![output_pipe], options, move |value| {
             let task_fut = task(value);
             async move {
                 task_fut
@@ -251,6 +252,7 @@ impl PipelineBuilder {
         mut self,
         input_pipe: impl AsRef<str>,
         output_pipes: Vec<impl AsRef<str>>,
+        options: WorkerOptions,
         task: F,
     ) -> Self
     where
@@ -274,7 +276,7 @@ impl PipelineBuilder {
                 reader: input_pipe,
                 writers: output_pipes,
             },
-            options: Default::default(),
+            options,
         });
         self
     }
@@ -305,13 +307,14 @@ impl PipelineBuilder {
     ///
     /// #[tokio::main]
     /// async fn main() {
-    ///     let sum = Arc::new(AtomicI32::new(0));
+    ///     use async_pipes::WorkerOptions;
+    /// let sum = Arc::new(AtomicI32::new(0));
     ///     let task_sum = sum.clone();
     ///
     ///     Pipeline::builder()
     ///         .with_inputs("NumberSets", vec![vec![1, 2], vec![3, 4, 5]])
     ///         .with_flattener::<Vec<i32>>("NumberSets", "Numbers")
-    ///         .with_consumer("Numbers", move |value: i32| {
+    ///         .with_consumer("Numbers", WorkerOptions::default_single_task(), move |value: i32| {
     ///             let sum = task_sum.clone();
     ///             async move {
     ///                 sum.fetch_add(value, Ordering::SeqCst);
@@ -390,7 +393,8 @@ impl PipelineBuilder {
     /// }
     ///
     /// fn build_consumer(sum: Arc<AtomicI32>) -> impl FnOnce(PipelineBuilder) -> PipelineBuilder {
-    ///     |builder| builder.with_consumer("Numbers", move |value: i32| {
+    ///     use async_pipes::WorkerOptions;
+    /// |builder| builder.with_consumer("Numbers", WorkerOptions::default(), move |value: i32| {
     ///         let sum = sum.clone();
     ///         async move {
     ///             sum.fetch_add(value, Ordering::SeqCst);

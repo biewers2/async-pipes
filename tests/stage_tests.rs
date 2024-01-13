@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering::{Acquire, Release, SeqCst};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 
-use async_pipes::{branch, Pipeline};
+use async_pipes::{branch, Pipeline, WorkerOptions};
 
 #[tokio::test]
 async fn test_stage_producer() {
@@ -21,9 +21,13 @@ async fn test_stage_producer() {
                 }
             }
         })
-        .with_consumer("pipe", |value: String| async move {
-            assert_eq!(value, "hello!".to_string());
-        })
+        .with_consumer(
+            "pipe",
+            WorkerOptions::default_single_task(),
+            |value: String| async move {
+                assert_eq!(value, "hello!".to_string());
+            },
+        )
         .build()
         .unwrap()
         .wait()
@@ -59,22 +63,30 @@ async fn test_stage_branching_producer() {
                 }
             }
         })
-        .with_consumer("Value", move |value: usize| {
-            let written = task_value_written.clone();
-            let sum = task_value_sum.clone();
-            async move {
-                written.store(true, Release);
-                sum.fetch_add(value, SeqCst);
-            }
-        })
-        .with_consumer("Doubled", move |value: usize| {
-            let written = task_double_written.clone();
-            let sum = task_double_sum.clone();
-            async move {
-                written.store(true, Release);
-                sum.fetch_add(value, SeqCst);
-            }
-        })
+        .with_consumer(
+            "Value",
+            WorkerOptions::default_single_task(),
+            move |value: usize| {
+                let written = task_value_written.clone();
+                let sum = task_value_sum.clone();
+                async move {
+                    written.store(true, Release);
+                    sum.fetch_add(value, SeqCst);
+                }
+            },
+        )
+        .with_consumer(
+            "Doubled",
+            WorkerOptions::default_single_task(),
+            move |value: usize| {
+                let written = task_double_written.clone();
+                let sum = task_double_sum.clone();
+                async move {
+                    written.store(true, Release);
+                    sum.fetch_add(value, SeqCst);
+                }
+            },
+        )
         .build()
         .unwrap()
         .wait()
@@ -103,15 +115,20 @@ async fn test_stage_single_output() {
         .with_stage(
             "first",
             "second",
+            WorkerOptions::default_single_task(),
             |value: usize| async move { Some(value + 1) },
         )
-        .with_consumer("second", move |value: usize| {
-            let written = task_written.clone();
-            async move {
-                assert_eq!(value, 2);
-                written.store(true, Release);
-            }
-        })
+        .with_consumer(
+            "second",
+            WorkerOptions::default_single_task(),
+            move |value: usize| {
+                let written = task_written.clone();
+                async move {
+                    assert_eq!(value, 2);
+                    written.store(true, Release);
+                }
+            },
+        )
         .build()
         .unwrap()
         .wait()
@@ -128,12 +145,16 @@ async fn test_stage_flattener() {
     Pipeline::builder()
         .with_inputs("first", vec![vec![1usize, 2usize, 3usize]])
         .with_flattener::<Vec<usize>>("first", "second")
-        .with_consumer("second", move |value: usize| {
-            let sum = task_sum.clone();
-            async move {
-                sum.fetch_add(value, SeqCst);
-            }
-        })
+        .with_consumer(
+            "second",
+            WorkerOptions::default_single_task(),
+            move |value: usize| {
+                let sum = task_sum.clone();
+                async move {
+                    sum.fetch_add(value, SeqCst);
+                }
+            },
+        )
         .build()
         .unwrap()
         .wait()
@@ -147,7 +168,11 @@ async fn test_stage_flattener() {
 async fn test_stage_propagates_task_panic() {
     Pipeline::builder()
         .with_inputs("pipe", vec![()])
-        .with_consumer("pipe", |_: ()| async move { panic!("AHH!") })
+        .with_consumer(
+            "pipe",
+            WorkerOptions::default_single_task(),
+            |_: ()| async move { panic!("AHH!") },
+        )
         .build()
         .unwrap()
         .wait()

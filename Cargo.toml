@@ -19,3 +19,4 @@ itertools = "0.12"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+ulid = "1.1"
