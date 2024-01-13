@@ -1,9 +1,9 @@
 [package]
 name = "async-pipes"
-version = "0.2.2"
+version = "0.3.0"
 authors = ["Jake Biewer <biewers2@gmail.com>"]
 edition = "2021"
-rust-version = "1.63.0" # According to `$ cargo msrv`
+rust-version = "1.74.1" # According to `$ cargo msrv`
 description = "A library for building concurrent data processing pipelines"
 license = "GPL-2.0-or-later"
 readme = "./README.md"
@@ -15,6 +15,8 @@ categories = ["asynchronous", "concurrency"]
 [dependencies]
 tokio = { version = "1", features = ["rt", "macros", "sync"] }
 uuid = { version = "1", features = ["v4"] }
+itertools = "0.12"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+ulid = "1.1"

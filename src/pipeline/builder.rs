@@ -1,14 +1,22 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use tokio::select;
-use tokio::sync::mpsc::{channel, Receiver};
+use itertools::Itertools;
 use tokio::task::JoinSet;
 
 use crate::pipeline::io::*;
 use crate::pipeline::sync::*;
+use crate::pipeline::workers::{
+    new_detached_flattener, new_detached_producer, new_detached_worker,
+};
 use crate::pipeline::*;
+
+struct CreateWorkersOutput {
+    producers: JoinSet<()>,
+    workers: JoinSet<()>,
+    signal_txs: Vec<Sender<StageWorkerSignal>>,
+}
 
 /// Used to construct a [Pipeline].
 ///
@@ -140,10 +148,10 @@ impl PipelineBuilder {
         Fut: Future<Output = Option<Vec<Option<BoxedAnySend>>>> + Send + 'static,
     {
         let pipes = pipes.iter().map(|p| p.as_ref().to_string()).collect();
-        self.stages.push(Stage::Producer(ProducerStage {
+        self.stages.push(Stage::Producer {
             function: Box::new(move || Box::pin(task())),
             pipes: ProducerPipeNames { writers: pipes },
-        }));
+        });
         self
     }
 
@@ -158,14 +166,14 @@ impl PipelineBuilder {
     ///
     /// This pipeline builder.
     ///
-    pub fn with_consumer<S, I, F, Fut>(self, pipe: S, task: F) -> Self
+    pub fn with_consumer<S, I, F, Fut>(self, pipe: S, options: WorkerOptions, task: F) -> Self
     where
         S: AsRef<str>,
         I: Send + 'static,
         F: Fn(I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.with_branching_stage(pipe, Vec::<String>::new(), move |value| {
+        self.with_branching_stage(pipe, Vec::<String>::new(), options, move |value| {
             let task_fut = task(value);
             async move {
                 task_fut.await;
@@ -195,6 +203,7 @@ impl PipelineBuilder {
         self,
         input_pipe: impl AsRef<str>,
         output_pipe: impl AsRef<str>,
+        options: WorkerOptions,
         task: F,
     ) -> Self
     where
@@ -203,7 +212,7 @@ impl PipelineBuilder {
         F: Fn(I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Option<O>> + Send + 'static,
     {
-        self.with_branching_stage(input_pipe, vec![output_pipe], move |value| {
+        self.with_branching_stage(input_pipe, vec![output_pipe], options, move |value| {
             let task_fut = task(value);
             async move {
                 task_fut
@@ -243,6 +252,7 @@ impl PipelineBuilder {
         mut self,
         input_pipe: impl AsRef<str>,
         output_pipes: Vec<impl AsRef<str>>,
+        options: WorkerOptions,
         task: F,
     ) -> Self
     where
@@ -257,7 +267,7 @@ impl PipelineBuilder {
             .collect();
         let err_pipe = input_pipe.clone();
 
-        self.stages.push(Stage::Regular(TaskStage {
+        self.stages.push(Stage::Regular {
             function: Box::new(move |value: BoxedAnySend| {
                 let value = downcast_from_pipe(value, &err_pipe);
                 Box::pin(task(*value))
@@ -266,7 +276,8 @@ impl PipelineBuilder {
                 reader: input_pipe,
                 writers: output_pipes,
             },
-        }));
+            options,
+        });
         self
     }
 
@@ -293,6 +304,7 @@ impl PipelineBuilder {
     /// use std::sync::Arc;
     /// use std::sync::atomic::{AtomicI32, Ordering};
     /// use async_pipes::Pipeline;
+    /// use async_pipes::WorkerOptions;
     ///
     /// #[tokio::main]
     /// async fn main() {
@@ -302,7 +314,7 @@ impl PipelineBuilder {
     ///     Pipeline::builder()
     ///         .with_inputs("NumberSets", vec![vec![1, 2], vec![3, 4, 5]])
     ///         .with_flattener::<Vec<i32>>("NumberSets", "Numbers")
-    ///         .with_consumer("Numbers", move |value: i32| {
+    ///         .with_consumer("Numbers", WorkerOptions::default_single_task(), move |value: i32| {
     ///             let sum = task_sum.clone();
     ///             async move {
     ///                 sum.fetch_add(value, Ordering::SeqCst);
@@ -334,7 +346,7 @@ impl PipelineBuilder {
         let output_pipe = to_pipe.as_ref().to_string();
         let err_pipe = input_pipe.clone();
 
-        self.stages.push(Stage::Iterator(IterStage {
+        self.stages.push(Stage::Iterator {
             stage_type: IterStageType::Flatten,
             caster: Box::new(move |value: BoxedAnySend| {
                 downcast_from_pipe::<It>(value, &err_pipe)
@@ -346,7 +358,8 @@ impl PipelineBuilder {
                 reader: input_pipe,
                 writers: vec![output_pipe],
             },
-        }));
+            options: WorkerOptions::default_single_task(),
+        });
         self
     }
 
@@ -380,7 +393,8 @@ impl PipelineBuilder {
     /// }
     ///
     /// fn build_consumer(sum: Arc<AtomicI32>) -> impl FnOnce(PipelineBuilder) -> PipelineBuilder {
-    ///     |builder| builder.with_consumer("Numbers", move |value: i32| {
+    ///     use async_pipes::WorkerOptions;
+    /// |builder| builder.with_consumer("Numbers", WorkerOptions::default(), move |value: i32| {
     ///         let sum = sum.clone();
     ///         async move {
     ///             sum.fetch_add(value, Ordering::SeqCst);
@@ -403,62 +417,21 @@ impl PipelineBuilder {
     /// 2. The reader of a pipe was used more than once.
     ///
     pub fn build(self) -> Result<Pipeline, String> {
-        // Create pipe IDs and register them in the synchronizer
+        let configs = self.create_pipe_configs()?;
+
+        // Register pipes in the synchronizer
         let mut synchronizer = Synchronizer::default();
-        let names = self.register_names(&mut synchronizer);
+        self.register_pipe_configs(&mut synchronizer, &configs);
 
         // Make the synchronizer immutable and the create the actual pipes
         let synchronizer = Arc::new(synchronizer);
-        let mut pipes = self.create_pipes(&synchronizer, names);
+        let pipes_map = self.create_pipes(&synchronizer, configs);
 
-        let mut producers = JoinSet::new();
-        let mut workers = JoinSet::new();
-        let mut signal_txs = Vec::new();
-
-        let mut worker_args =
-            |pipe_names: TaskPipeNames, pipes: &mut HashMap<String, Pipe<BoxedAnySend>>| {
-                let writers = find_writers(&pipe_names.writers, pipes)?;
-                let reader = find_reader(&pipe_names.reader, pipes)?;
-
-                let (signal_tx, signal_rx) = channel(1);
-                signal_txs.push(signal_tx);
-
-                Result::<_, String>::Ok((reader, writers, signal_rx))
-            };
-
-        let mut has_producer = false;
-        for stage in self.stages {
-            match stage {
-                Stage::Producer(producer) => {
-                    let writers = find_writers(&producer.pipes.writers, &pipes)?;
-                    has_producer = true;
-                    producers.spawn(Self::new_detached_producer(producer.function, writers));
-                }
-
-                Stage::Regular(task) => {
-                    let (reader, writers, signal_rx) = worker_args(task.pipes, &mut pipes)?;
-                    workers.spawn(Self::new_detached_worker(
-                        task.function,
-                        reader,
-                        writers,
-                        signal_rx,
-                    ));
-                }
-
-                Stage::Iterator(iter) => {
-                    let (reader, writers, signal_rx) = worker_args(iter.pipes, &mut pipes)?;
-                    workers.spawn(match iter.stage_type {
-                        IterStageType::Flatten => {
-                            Self::new_detached_flattener(iter.caster, reader, writers, signal_rx)
-                        }
-                    });
-                }
-            }
-        }
-
-        if !has_producer {
-            return Err("pipeline must have at least one producer".to_string());
-        }
+        let CreateWorkersOutput {
+            producers,
+            workers,
+            signal_txs,
+        } = self.create_workers(pipes_map)?;
 
         Ok(Pipeline {
             synchronizer,
@@ -468,41 +441,117 @@ impl PipelineBuilder {
         })
     }
 
-    /// Register all the pipe names to the synchronizer.
-    ///
-    /// This is done before creating the pipes as the synchronizer only needs to be mutable
-    /// for this step, afterwards it can be considered "immutable".
-    fn register_names(&self, sync: &mut Synchronizer) -> Vec<String> {
-        let names = self.names();
-        for name in &names {
-            sync.register(name);
+    /// Create the producers, workers, and the associated signal channels.
+    fn create_workers(
+        self,
+        mut pipes_map: HashMap<String, Pipe<BoxedAnySend>>,
+    ) -> Result<CreateWorkersOutput, String> {
+        let mut producers = JoinSet::new();
+        let mut workers = JoinSet::new();
+        let mut signal_txs = Vec::new();
+
+        let mut worker_args =
+            |pipe_names: TaskPipeNames, pipes: &mut HashMap<String, Pipe<BoxedAnySend>>| {
+                let writers = find_writers(&pipe_names.writers, pipes)?;
+                let reader = find_reader(&pipe_names.reader, pipes)?;
+
+                let (signal_tx, signal_rx) = tokio::sync::mpsc::channel(1);
+                signal_txs.push(signal_tx);
+
+                Result::<_, String>::Ok((reader, writers, signal_rx))
+            };
+
+        let mut has_producer = false;
+        for stage in self.stages {
+            match stage {
+                Stage::Producer { function, pipes } => {
+                    let writers = find_writers(&pipes.writers, &pipes_map)?;
+                    has_producer = true;
+                    producers.spawn(new_detached_producer(function, writers));
+                }
+
+                Stage::Regular {
+                    function,
+                    pipes,
+                    options,
+                } => {
+                    let (reader, writers, signal_rx) = worker_args(pipes, &mut pipes_map)?;
+                    workers.spawn(new_detached_worker(
+                        function,
+                        reader,
+                        writers,
+                        signal_rx,
+                        options.try_into()?,
+                    ));
+                }
+
+                Stage::Iterator {
+                    stage_type,
+                    caster,
+                    pipes,
+                    options,
+                } => {
+                    let (reader, writers, signal_rx) = worker_args(pipes, &mut pipes_map)?;
+                    workers.spawn(match stage_type {
+                        IterStageType::Flatten => new_detached_flattener(
+                            caster,
+                            reader,
+                            writers,
+                            signal_rx,
+                            options.try_into()?,
+                        ),
+                    });
+                }
+            }
         }
-        names
+
+        if !has_producer {
+            return Err("pipeline must have at least one producer".to_string());
+        }
+
+        Ok(CreateWorkersOutput {
+            producers,
+            workers,
+            signal_txs,
+        })
     }
 
-    /// Collect the names of all the pipes.
+    /// Construct the configuration of all the pipes.
     ///
     /// We can achieve a set of unique names easily by using the `reader` of the "task" and "iter"
     /// stages and de-duplicating that list.
     ///
     /// For each pipe, there is only one reader, but there can be multiple writers.
     /// Also, producers do not have a reader, only writers.
-    fn names(&self) -> Vec<String> {
-        let mut names = HashSet::new();
-
+    fn create_pipe_configs(&self) -> Result<Vec<PipeConfig>, String> {
+        let mut configs = Vec::new();
         for stage in &self.stages {
             match stage {
-                Stage::Regular(task) => {
-                    names.insert(task.pipes.reader.clone());
+                Stage::Regular { pipes, options, .. } | Stage::Iterator { pipes, options, .. } => {
+                    configs.push(PipeConfig {
+                        name: pipes.reader.clone(),
+                        options: options.clone().try_into()?,
+                    });
                 }
-                Stage::Iterator(iter) => {
-                    names.insert(iter.pipes.reader.clone());
-                }
+
                 _ => {}
-            };
+            }
         }
 
-        names.into_iter().collect()
+        Ok(configs
+            .into_iter()
+            .unique_by(|conf| conf.name.clone())
+            .collect())
+    }
+
+    /// Register all the pipe configurations to the synchronizer.
+    ///
+    /// This is done before creating the pipes as the synchronizer only needs to be mutable
+    /// for this step, afterwards it can be considered "immutable".
+    fn register_pipe_configs(&self, sync: &mut Synchronizer, pipe_configs: &[PipeConfig]) {
+        for conf in pipe_configs {
+            sync.register(&conf.name);
+        }
     }
 
     /// The reader of a pipe is wrapped in an option to allow the build method to [Option::take] it
@@ -510,132 +559,19 @@ impl PipelineBuilder {
     fn create_pipes(
         &self,
         sync: &Arc<Synchronizer>,
-        names: Vec<String>,
+        configs: Vec<PipeConfig>,
     ) -> HashMap<String, Pipe<BoxedAnySend>> {
-        let mut pipes = HashMap::new();
-        for name in names {
-            let (tx, rx) = channel(100);
-            let pipe = Pipe {
-                writer: PipeWriter::new(&name, sync.clone(), tx),
-                reader: Some(PipeReader::new(&name, sync.clone(), rx)),
-            };
-            pipes.insert(name, pipe);
-        }
-        pipes
-    }
-
-    /// Create a new worker that produces values until there are no more to produce.
-    async fn new_detached_producer(
-        mut producer: ProducerFn,
-        writers: Vec<PipeWriter<BoxedAnySend>>,
-    ) {
-        while let Some(results) = (*producer)().await {
-            write_results(&writers, results).await;
-        }
-    }
-
-    /// Create a new worker that runs and manages tasks.
-    async fn new_detached_worker(
-        task: TaskFn,
-        reader: PipeReader<BoxedAnySend>,
-        writers: Vec<PipeWriter<BoxedAnySend>>,
-        signal_rx: Receiver<StageWorkerSignal>,
-    ) {
-        Self::new_detached_multi_task_worker(reader, writers, signal_rx, move |value, writers| {
-            let results = task(value);
-            async move {
-                if let Some(results) = results.await {
-                    write_results(&writers, results).await;
-                }
-            }
-        })
-        .await;
-    }
-
-    /// Create a new worker that "flattens" data from one pipe to another.
-    async fn new_detached_flattener(
-        caster: IterCastFn,
-        reader: PipeReader<BoxedAnySend>,
-        writers: Vec<PipeWriter<BoxedAnySend>>,
-        signal_rx: Receiver<StageWorkerSignal>,
-    ) {
-        Self::new_detached_single_task_worker(reader, writers, signal_rx, move |value, writers| {
-            let values = caster(value);
-            async move {
-                for value in values {
-                    write_results(&writers, vec![Some(value)]).await;
-                }
-            }
-        })
-        .await;
-    }
-
-    /// Creates a new worker that runs tasks synchronously.
-    async fn new_detached_single_task_worker<F, Fut>(
-        mut reader: PipeReader<BoxedAnySend>,
-        writers: Vec<PipeWriter<BoxedAnySend>>,
-        mut signal_rx: Receiver<StageWorkerSignal>,
-        new_task: F,
-    ) where
-        F: Fn(BoxedAnySend, Vec<PipeWriter<BoxedAnySend>>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        loop {
-            select! {
-                Some((value, _consumed)) = reader.read() => {
-                    let writers = writers.clone();
-                    new_task(value, writers).await;
-                }
-
-                // Receive external signals
-                Some(signal) = signal_rx.recv() => {
-                    match signal {
-                        StageWorkerSignal::Terminate => break,
-                    }
-                },
-            }
-        }
-    }
-
-    /// Creates a new worker that runs tasks asynchronously by spawning tasks to a [JoinSet].
-    async fn new_detached_multi_task_worker<F, Fut>(
-        mut reader: PipeReader<BoxedAnySend>,
-        writers: Vec<PipeWriter<BoxedAnySend>>,
-        mut signal_rx: Receiver<StageWorkerSignal>,
-        new_task: F,
-    ) where
-        F: Fn(BoxedAnySend, Vec<PipeWriter<BoxedAnySend>>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        let mut tasks = JoinSet::new();
-
-        loop {
-            select! {
-                Some((value, consumed)) = reader.read(), if tasks.len() < 1000 => {
-                    let writers = writers.clone();
-                    let task = new_task(value, writers);
-
-                    tasks.spawn(async move {
-                        // Take ownership in order to drop it once task ends
-                        let _c = consumed;
-                        task.await
-                    });
-                }
-
-                // Join tasks to check for errors
-                Some(result) = tasks.join_next(), if !tasks.is_empty() => {
-                    check_join_result(result);
-                }
-
-                // Receive external signals
-                Some(signal) = signal_rx.recv() => {
-                    match signal {
-                        StageWorkerSignal::Terminate => break,
-                    }
-                },
-            }
-        }
-
-        tasks.shutdown().await;
+        configs
+            .into_iter()
+            .map(|conf| {
+                let buf_size = conf.options.reader_buffer_size.get();
+                let (tx, rx) = tokio::sync::mpsc::channel(buf_size);
+                let pipe = Pipe {
+                    writer: PipeWriter::new(&conf.name, sync.clone(), tx),
+                    reader: Some(PipeReader::new(&conf.name, sync.clone(), rx)),
+                };
+                (conf.name, pipe)
+            })
+            .collect()
     }
 }
