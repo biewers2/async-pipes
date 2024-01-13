@@ -7,6 +7,9 @@
   * To resolve the breaking change, for each non-producer stage defined, add in
     `WorkerOptions::default()` before the task definition/closure.
 
+**Note(s)**:
+* The MSRV is now `1.74.1` (previously `1.63.0`).
+
 ## 0.2.2 (Jan 11, 2024)
 
 **Feature(s):**
