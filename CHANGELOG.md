@@ -1,3 +1,8 @@
+## 0.3.1 (Feb 4, 2024)
+**Fixes:**
+* Cyclic pipelines that use a flatten stage were found to deadlock due to all  the buffers being
+  full. Now, flatten stages use an unbounded channel for pipes so this doesn't happen.
+
 ## 0.3.0 (Jan 13, 2024)
 **Feature(s):**
 * Add `WorkerOptions` struct
