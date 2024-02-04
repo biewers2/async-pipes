@@ -91,7 +91,7 @@ pub async fn new_detached_flattener(
 
 /// Creates a new worker that runs tasks synchronously.
 ///
-/// We could use the multi-task worker and limit the number of active tasks to one, but this
+/// We could use the multitask worker and limit the number of active tasks to one, but this
 /// reduces the overhead of spawning tasks and waiting for them to finish.
 async fn new_detached_single_task_worker<F, Fut>(
     mut reader: PipeReader<BoxedAnySend>,
