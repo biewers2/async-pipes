@@ -1,15 +1,73 @@
 use std::sync::Arc;
 
-use tokio::sync::mpsc::{Receiver, Sender};
-
 use crate::pipeline::sync::Synchronizer;
 
-pub struct Consumed {
+macro_rules! variable_channels {
+    (<$t:ident> $($var:ident($tx:ty, $rx:ty)),+ $(,)?) => {
+        #[derive(Debug)]
+        pub enum VarSender<$t> {
+            $( $var($tx), )*
+        }
+
+        #[derive(Debug)]
+        pub enum VarReceiver<$t> {
+            $( $var($rx), )*
+        }
+
+        impl<$t> Clone for VarSender<$t> {
+            fn clone(&self) -> Self {
+                match self {
+                    $( Self::$var(tx) => Self::$var(tx.clone()), )*
+                }
+            }
+        }
+
+        impl<$t> VarReceiver<$t> {
+            async fn recv(&mut self) -> Option<$t> {
+                match self {
+                    $( Self::$var(rx) => rx.recv().await, )*
+                }
+            }
+        }
+
+        $(
+            impl<$t> From<$tx> for VarSender<$t> {
+                fn from(value: $tx) -> Self {
+                    Self::$var(value)
+                }
+            }
+
+            impl<$t> From<$rx> for VarReceiver<$t> {
+                fn from(value: $rx) -> Self {
+                    Self::$var(value)
+                }
+            }
+        )*
+    };
+}
+
+variable_channels! {
+    <T>
+    MpscBounded(tokio::sync::mpsc::Sender<T>, tokio::sync::mpsc::Receiver<T>),
+    MpscUnbounded(tokio::sync::mpsc::UnboundedSender<T>, tokio::sync::mpsc::UnboundedReceiver<T>),
+}
+
+impl<T> VarSender<T> {
+    /// Implement send outside of macro because of variations in sender interfaces.
+    async fn send(&self, t: T) -> Result<(), tokio::sync::mpsc::error::SendError<T>> {
+        match self {
+            Self::MpscBounded(tx) => tx.send(t).await,
+            Self::MpscUnbounded(tx) => tx.send(t),
+        }
+    }
+}
+
+pub struct ConsumeOnDrop {
     id: String,
     sync: Arc<Synchronizer>,
 }
 
-impl Drop for Consumed {
+impl Drop for ConsumeOnDrop {
     fn drop(&mut self) {
         self.sync.ended(&self.id)
     }
@@ -20,19 +78,19 @@ impl Drop for Consumed {
 pub struct PipeReader<T> {
     pipe_id: String,
     synchronizer: Arc<Synchronizer>,
-    rx: Receiver<T>,
+    rx: VarReceiver<T>,
 }
 
 impl<T> PipeReader<T> {
     pub fn new(
-        pipe_id: impl Into<String>,
+        pipe_id: String,
         synchronizer: Arc<Synchronizer>,
-        input_rx: Receiver<T>,
+        rx: impl Into<VarReceiver<T>>,
     ) -> Self {
         Self {
-            pipe_id: pipe_id.into(),
+            pipe_id,
             synchronizer,
-            rx: input_rx,
+            rx: rx.into(),
         }
     }
 
@@ -42,15 +100,15 @@ impl<T> PipeReader<T> {
     }
 
     /// Receive the next value from the inner receiver.
-    pub async fn read(&mut self) -> Option<(T, Consumed)> {
-        self.rx.recv().await.map(|v| (v, self.consumed()))
-    }
+    pub async fn read(&mut self) -> Option<(T, ConsumeOnDrop)> {
+        self.rx.recv().await.map(|v| {
+            let cod = ConsumeOnDrop {
+                id: self.pipe_id.clone(),
+                sync: self.synchronizer.clone(),
+            };
 
-    fn consumed(&self) -> Consumed {
-        Consumed {
-            id: self.pipe_id.clone(),
-            sync: self.synchronizer.clone(),
-        }
+            (v, cod)
+        })
     }
 }
 
@@ -59,7 +117,7 @@ impl<T> PipeReader<T> {
 pub struct PipeWriter<T> {
     pipe_id: String,
     synchronizer: Arc<Synchronizer>,
-    tx: Sender<T>,
+    tx: VarSender<T>,
 }
 
 /// Manually implement [Clone] for [PipeWriter] over `T`, as deriving [Clone]
@@ -76,14 +134,14 @@ impl<T> Clone for PipeWriter<T> {
 
 impl<T> PipeWriter<T> {
     pub fn new(
-        pipe_id: impl Into<String>,
+        pipe_id: String,
         synchronizer: Arc<Synchronizer>,
-        output_tx: Sender<T>,
+        tx: impl Into<VarSender<T>>,
     ) -> Self {
         Self {
-            pipe_id: pipe_id.into(),
+            pipe_id,
             synchronizer,
-            tx: output_tx,
+            tx: tx.into(),
         }
     }
 
@@ -120,7 +178,7 @@ mod tests {
         let sync = Arc::new(sync);
         let (tx, rx) = channel::<()>(1);
 
-        let mut input = PipeReader::new(id, sync.clone(), rx);
+        let mut input = PipeReader::new(id.to_string(), sync.clone(), rx);
 
         tx.send(()).await.unwrap();
 

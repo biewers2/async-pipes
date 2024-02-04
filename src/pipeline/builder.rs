@@ -527,7 +527,16 @@ impl PipelineBuilder {
         let mut configs = Vec::new();
         for stage in &self.stages {
             match stage {
-                Stage::Regular { pipes, options, .. } | Stage::Iterator { pipes, options, .. } => {
+                Stage::Iterator { pipes, options, .. } => {
+                    let mut options: ValidWorkerOptions = options.clone().try_into()?;
+                    options.unbounded_buffer = true;
+
+                    configs.push(PipeConfig {
+                        name: pipes.reader.clone(),
+                        options,
+                    });
+                }
+                Stage::Regular { pipes, options, .. } => {
                     configs.push(PipeConfig {
                         name: pipes.reader.clone(),
                         options: options.clone().try_into()?,
@@ -547,7 +556,7 @@ impl PipelineBuilder {
     /// Register all the pipe configurations to the synchronizer.
     ///
     /// This is done before creating the pipes as the synchronizer only needs to be mutable
-    /// for this step, afterwards it can be considered "immutable".
+    /// for this step, afterward it can be considered "immutable".
     fn register_pipe_configs(&self, sync: &mut Synchronizer, pipe_configs: &[PipeConfig]) {
         for conf in pipe_configs {
             sync.register(&conf.name);
@@ -564,11 +573,19 @@ impl PipelineBuilder {
         configs
             .into_iter()
             .map(|conf| {
-                let buf_size = conf.options.reader_buffer_size.get();
-                let (tx, rx) = tokio::sync::mpsc::channel(buf_size);
+                let (tx, rx): (VarSender<BoxedAnySend>, VarReceiver<BoxedAnySend>) =
+                    if conf.options.unbounded_buffer {
+                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        (tx.into(), rx.into())
+                    } else {
+                        let buf_size = conf.options.reader_buffer_size.get();
+                        let (tx, rx) = tokio::sync::mpsc::channel(buf_size);
+                        (tx.into(), rx.into())
+                    };
+
                 let pipe = Pipe {
-                    writer: PipeWriter::new(&conf.name, sync.clone(), tx),
-                    reader: Some(PipeReader::new(&conf.name, sync.clone(), rx)),
+                    writer: PipeWriter::new(conf.name.clone(), sync.clone(), tx),
+                    reader: Some(PipeReader::new(conf.name.clone(), sync.clone(), rx)),
                 };
                 (conf.name, pipe)
             })

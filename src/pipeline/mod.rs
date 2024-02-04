@@ -85,6 +85,7 @@ impl WorkerOptions {
 
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 struct ValidWorkerOptions {
+    unbounded_buffer: bool,
     reader_buffer_size: NonZeroUsize,
     max_task_count: NonZeroUsize,
 }
@@ -94,6 +95,7 @@ impl TryFrom<WorkerOptions> for ValidWorkerOptions {
 
     fn try_from(value: WorkerOptions) -> Result<Self, Self::Error> {
         Ok(Self {
+            unbounded_buffer: false,
             reader_buffer_size: NonZeroUsize::new(value.pipe_buffer_size)
                 .ok_or("reader buffer size must not be zero")?,
             max_task_count: NonZeroUsize::new(value.max_task_count)
@@ -379,7 +381,7 @@ impl Pipeline {
         };
 
         // Effectively, make progress until all producers are done.
-        // We do this to prevent the synchronizer from causing the pipeline to shutdown too early.
+        // We do this to prevent the synchronizer from causing the pipeline to shut down too early.
         select! {
             _ = wait_for_producers => {},
             _ = wait_for_workers(workers_to_progress),
